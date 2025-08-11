@@ -261,6 +261,9 @@ trainer:
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 
+  # Whether to save token IDs instead of decoded text when dumping rollout data
+  save_token_ids: false
+
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 

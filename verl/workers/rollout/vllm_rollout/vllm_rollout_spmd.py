@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import json
 import logging
 import os
 import pickle
@@ -36,6 +37,9 @@ from copy import deepcopy
 from types import MethodType
 from typing import Any
 
+# Problem ID context manager is available through ArcticInference plugin
+# No need to import manually - vllm.plugins.load_general_plugins() handles this
+
 import numpy as np
 import ray
 import torch
@@ -44,6 +48,52 @@ import zmq
 from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
+
+# # Import aimv2 fix early to prevent duplicate registration issues
+# try:
+#     from verl.utils.aimv2_fix import apply_aimv2_fix
+#     apply_aimv2_fix()
+# except ImportError:
+#     # Fallback to direct patch if utils module is not available
+#     try:
+#         import transformers.models.auto.configuration_auto as config_auto
+#         original_register = config_auto.CONFIG_MAPPING.register
+        
+#         def patched_register(key, value, exist_ok=False):
+#             if key == "aimv2":
+#                 exist_ok = True
+#             return original_register(key, value, exist_ok=exist_ok)
+        
+#         config_auto.CONFIG_MAPPING.register = patched_register
+#     except Exception:
+#         pass
+
+# CRITICAL: Fix transformers/vllm aimv2 conflict before importing vllm
+try:
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from transformers import AutoConfig
+    
+    # Store original methods
+    orig_mapping_register = CONFIG_MAPPING.register
+    orig_auto_register = AutoConfig.register
+    
+    # Create safe wrappers that allow aimv2 duplicates
+    def safe_mapping_register(key, value, exist_ok=False):
+        if key == "aimv2":
+            exist_ok = True
+        return orig_mapping_register(key, value, exist_ok=exist_ok)
+    
+    def safe_auto_register(model_type, config, exist_ok=False):
+        if model_type == "aimv2":
+            exist_ok = True
+        return orig_auto_register(model_type, config, exist_ok=exist_ok)
+    
+    # Apply patches
+    CONFIG_MAPPING.register = safe_mapping_register
+    AutoConfig.register = safe_auto_register
+except:
+    pass
+
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
@@ -208,6 +258,82 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        
+        # Initialize suffix cache data storage path if available
+        self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
+        
+        # Problem ID context manager is ready to use (no installation needed)
+
+    def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
+        """
+        Load suffix cache bootstrap data for specific problem IDs from previous epochs.
+        
+        Args:
+            problem_ids (list): List of problem IDs to load cache data for
+            
+        Returns:
+            dict: Mapping from problem_id to list of token sequences for suffix cache bootstrap
+        """
+        if not self.suffix_cache_data_path or not problem_ids:
+            return {}
+            
+        problem_id_to_sequences = []
+        
+        # Check if the path exists
+        if not os.path.exists(self.suffix_cache_data_path):
+            print(f"Suffix cache data path does not exist: {self.suffix_cache_data_path}")
+            return {}
+        # Handle both directory and file paths
+        files_to_process = []
+        if os.path.isdir(self.suffix_cache_data_path):
+            # Search for JSONL files in the directory
+            for filename in os.listdir(self.suffix_cache_data_path):
+                if filename.endswith('.jsonl'):
+                    files_to_process.append(os.path.join(self.suffix_cache_data_path, filename))
+        elif os.path.isfile(self.suffix_cache_data_path):
+            files_to_process = [self.suffix_cache_data_path]
+        
+        if not files_to_process:
+            print(f"No JSONL files found in suffix cache data path: {self.suffix_cache_data_path}")
+            return {}
+        #print("DEBUG:Files found:", files_to_process)
+        try:
+            for file_path in files_to_process:
+                print(f"Loading suffix cache data from: {file_path}")
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        try:                            
+                            data = json.loads(line.strip())
+                            # Only support token IDs format
+                            if 'output_token_ids' in data:
+                                # Data saved with save_token_ids=True
+                                output_data = data['output_token_ids']
+                                print(f"DEBUG: Loaded token IDs: {len(output_data)} tokens")
+                                problem_id_to_sequences.append(output_data)
+                            else:
+                                print(f"WARNING: No 'output_token_ids' field found in data: {list(data.keys())}. Only token IDs format is supported.")
+                                continue
+                            # print("DEBUG:'problem_id' in data", 'problem_id' in data)
+                            # #print("DEBUG:'output' in data", 'output' in data)
+                            # if 'problem_id' in data and 'output' in data:
+                            #     problem_id = data['problem_id']
+                            #     if problem_id in problem_ids:
+                            #         #print("DEBUG:problem_id in problem_ids", problem_id)
+                            #         output_text = data['output']
+                            #         if problem_id not in problem_id_to_sequences:
+                            #             problem_id_to_sequences[problem_id] = []
+                            #         # Store the output text
+                            #         problem_id_to_sequences[problem_id].append(output_text)
+                        except json.JSONDecodeError as e:
+                            print(f"Failed to parse JSON line in {file_path}: {line.strip()}, error: {e}")
+                            continue
+                        
+        except Exception as e:
+            print(f"Failed to load suffix cache data: {e}")
+            
+        print(f"Loaded suffix cache data for {len(problem_id_to_sequences)} problem IDs from {len(files_to_process)} files")
+          
+        return problem_id_to_sequences
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -267,16 +393,24 @@ class vLLMRollout(BaseRollout):
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
+        # Extract problem_id if available
+        problem_ids = non_tensor_batch.get("problem_id", None)
+        
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
-            ):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+            for i, (raw_prompt_ids, multi_modal_data,problem_id) in enumerate(zip(
+                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"),non_tensor_batch.pop("problem_id"),
+                strict=True
+            )):
+                vllm_input = {"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data,"problem_id":problem_id}
+                vllm_inputs.append(vllm_input)
         else:
-            vllm_inputs = [
-                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
-            ]
+            vllm_inputs = []
+            for i, (raw_prompt_ids,problem_id) in enumerate(zip(non_tensor_batch.pop("raw_prompt_ids"),non_tensor_batch.pop("problem_id"))):
+                vllm_input = {"prompt_token_ids": raw_prompt_ids,"problem_id":problem_id}
+                vllm_inputs.append(vllm_input)
+
+        #print("DEBUG: sample problem_ids:", [x["problem_id"] for x in vllm_inputs])
 
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
@@ -317,14 +451,98 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
+        # Load and apply suffix cache bootstrap data if available
+        try:
+            suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+            
+            if problem_ids is not None and suffix_cache is not None:
+                #print("DEBUG: Starting suffix cache bootstrap for problem_ids:", problem_ids[:3])
+                unique_problem_ids = list(set(problem_ids))
+                
+                # Add more distinguishing information to avoid log aggregation
+                import os
+                worker_pid = os.getpid()
+                import socket
+                hostname = socket.gethostname()
+                
+                # Try to get GPU rank information
+                gpu_rank = "unknown"
+                local_rank = "unknown"
+                world_size = "unknown"
+                
+                try:
+                    # Check for CUDA_VISIBLE_DEVICES
+                    cuda_devices = os.environ.get('CUDA_VISIBLE_DEVICES', 'not_set')
+                    
+                    # Check for distributed training environment variables
+                    local_rank = os.environ.get('LOCAL_RANK', os.environ.get('SLURM_LOCALID', 'unknown'))
+                    world_size = os.environ.get('WORLD_SIZE', os.environ.get('SLURM_NTASKS', 'unknown'))
+                    gpu_rank = os.environ.get('RANK', os.environ.get('SLURM_PROCID', 'unknown'))
+                    
+                    # Try to get Ray worker info if available
+                    try:
+                        import ray
+                        if ray.is_initialized():
+                            worker_id = ray.get_runtime_context().get_worker_id()
+                            node_id = ray.get_runtime_context().get_node_id()
+                            print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, RAY_WORKER={worker_id[:8]}, RAY_NODE={node_id[:8]}, unique_problem_ids: {unique_problem_ids}")
+                        else:
+                            print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, unique_problem_ids: {unique_problem_ids}")
+                    except:
+                        print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, unique_problem_ids: {unique_problem_ids}")
+                        
+                except Exception as e:
+                    print(f"DEBUG: PID={worker_pid}, Host={hostname}, ERROR_GETTING_RANK={e}, unique_problem_ids: {unique_problem_ids}")
+                problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
+                if problem_id_to_sequences:
+                    logger.info(f"Loading suffix cache data for {len(problem_id_to_sequences)} problem IDs")
+                    
+                    # Process token IDs data for suffix cache
+                    try:
+                        for output_index, token_ids in enumerate(problem_id_to_sequences):
+                            output_index += 1
+                            
+                            # Data is already token IDs, use directly
+                            print(f"DEBUG: Using token IDs directly: {len(token_ids)} tokens, first_10: {token_ids[:10]}")
+                            
+                            if token_ids:  # Only update if we have valid tokens
+                                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(req_id=-output_index-1, token_ids=token_ids)
+                    except Exception as e:
+                        print(f"Failed to update suffix cache: {e}")
+                        #print("DEBUG: Tokenizer access failed:", e)
+        except Exception as e:
+            print(f"Skipping update suffix cache: {e}")
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            # Use problem_id context manager from ArcticInference plugin if problem_ids provided
+            if problem_ids is not None:
+                try:
+                    # ArcticInference plugin provides ProblemIdContextManager
+                    from rllm.ArcticInference.arctic_inference.vllm.model_runner import ProblemIdContextManager
+                    with ProblemIdContextManager.batch_context(problem_ids):
+                        outputs = self.inference_engine.generate(
+                            prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                            sampling_params=self.sampling_params,
+                            lora_request=lora_requests,
+                            use_tqdm=False,
+                        )
+                except ImportError:
+                    # Fallback if ArcticInference plugin is not available
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=False,
+                    )
+            else:
+                # No problem_ids provided
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)

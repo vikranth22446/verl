@@ -325,6 +325,13 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        
+        # Preserve problem_id if it exists in the original dataframe data
+        original_data = self.dataframe[item]
+        if "problem_id" in original_data:
+            #print("DEBUG: problem_id is exist?: ", "problem_id" in original_data)
+            row_dict["problem_id"] = original_data["problem_id"]
+            
         return row_dict
 
     def __getstate__(self):

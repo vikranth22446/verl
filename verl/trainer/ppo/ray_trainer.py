@@ -629,18 +629,35 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, save_token_ids=False):
+        """Dump rollout/validation samples as JSONL.
+        
+        Args:
+            inputs: List of input prompts (text strings or token ID lists)
+            outputs: List of output responses (text strings or token ID lists) 
+            scores: List of reward scores
+            reward_extra_infos_dict: Dictionary of additional info to save
+            dump_path: Directory path to save the file
+            save_token_ids: If True, inputs/outputs are token ID lists; if False, they are text strings
+        """
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
         n = len(inputs)
-        base_data = {
-            "input": inputs,
-            "output": outputs,
-            "score": scores,
-            "step": [self.global_steps] * n,
-        }
+        if save_token_ids:
+            base_data = {
+                "input_token_ids": inputs,
+                "output_token_ids": outputs,
+                "score": scores,
+                "step": [self.global_steps] * n,
+            }
+        else:
+            base_data = {
+                "input": inputs,
+                "output": outputs,
+                "score": scores,
+                "step": [self.global_steps] * n,
+            }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -695,7 +712,8 @@ class RayPPOTrainer:
 
             # repeat test batch
             test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, 
+                interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
             )
 
             # we only do validation on rule-based rm
@@ -720,6 +738,8 @@ class RayPPOTrainer:
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
+            if "problem_id" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("problem_id")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -784,12 +804,14 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            # For validation data, we always save as text (not token IDs)
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                save_token_ids=False,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -1152,6 +1174,8 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("index")
                 if "agent_name" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
+                if "problem_id" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("problem_id")
 
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
@@ -1160,7 +1184,15 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_batch = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, 
+                    interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
+                )
+
+                # print("DEBUG:batch.non_tensor_batch[problem_id]", len(batch.non_tensor_batch["problem_id"]))
+                # inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                # print("DEBUG:input lengths", len(inputs))
+
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1196,8 +1228,13 @@ class RayPPOTrainer:
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, 
+                        interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
+                    )
                     batch = batch.union(gen_batch_output)
+
+                    
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1325,17 +1362,31 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                            save_token_ids = self.config.trainer.get("save_token_ids", False)
+                            print("DEBUG:save_token_ids", save_token_ids)
+                            if save_token_ids:
+                                # Save token IDs instead of decoded text
+                                inputs = batch.batch["prompts"].cpu().tolist()
+                                outputs = batch.batch["responses"].cpu().tolist()
+                            else:
+                                # Save decoded text (original behavior)
+                                inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                                outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
                                     "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
+                                )
+                            if "problem_id" in batch.non_tensor_batch:
+                                reward_extra_infos_dict.setdefault(
+                                    "problem_id", 
+                                    batch.non_tensor_batch["problem_id"].tolist(),
                                 )
                             self._dump_generations(
                                 inputs=inputs,
@@ -1343,19 +1394,20 @@ class RayPPOTrainer:
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
+                                save_token_ids=save_token_ids,
                             )
 
                     # validate
-                    if (
-                        self.val_reward_fn is not None
-                        and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                    ):
-                        with marked_timer("testing", timing_raw, color="green"):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
+                    # if (
+                    #     self.val_reward_fn is not None
+                    #     and self.config.trainer.test_freq > 0
+                    #     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    # ):
+                    #     with marked_timer("testing", timing_raw, color="green"):
+                    #         val_metrics: dict = self._validate()
+                    #         if is_last_step:
+                    #             last_val_metrics = val_metrics
+                    #     metrics.update(val_metrics)
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(

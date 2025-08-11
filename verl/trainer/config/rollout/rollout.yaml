@@ -73,6 +73,11 @@ do_sample: True
 # number of responses (i.e. num sample times). > 1 for grpo
 n: 1
 
+# whether to use interleave mode when repeating batches for multiple sampling
+# true: [A, A, B, B, C, C] 
+# false: [A, B, C, A, B, C]
+interleave: true
+
 # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
 multi_stage_wake_up: false
 

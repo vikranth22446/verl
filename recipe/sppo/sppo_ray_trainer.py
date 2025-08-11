@@ -322,6 +322,7 @@ class RaySPPOTrainer(RayPPOTrainer):
                             scores=scores,
                             reward_extra_infos_dict=reward_extra_infos_dict,
                             dump_path=rollout_data_dir,
+                            save_token_ids=False,
                         )
 
                 # validate

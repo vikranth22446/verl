@@ -725,6 +725,7 @@ class RaySPINTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                save_token_ids=False,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

@@ -21,7 +21,10 @@ PPO_RAY_RUNTIME_ENV = {
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        # Add Python startup code to fix aimv2 registration in all subprocesses
+        "PYTHONSTARTUP": "/tmp/aimv2_fix_startup.py",
     },
+    #"py_modules": ["verl.utils.aimv2_fix"],  # Ensure aimv2 fix is available in Ray workers
 }
 
 

@@ -15,6 +15,11 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
+# # Import aimv2 fix early to prevent duplicate registration issues
+# from verl.utils.aimv2_fix import apply_aimv2_fix, setup_subprocess_fix
+# apply_aimv2_fix()
+# setup_subprocess_fix()
+
 import os
 import socket
 
