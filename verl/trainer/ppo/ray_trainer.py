@@ -944,6 +944,11 @@ class RayPPOTrainer:
             from verl.experimental.agent_loop import AgentLoopManager
 
             self.async_rollout_mode = True
+            if not self.config.data.get("return_raw_chat", False):
+                raise ValueError(
+                    "Agent loop mode requires 'return_raw_chat=True' in data config. "
+                    "Please set config.data.return_raw_chat=True"
+                )
             self.async_rollout_manager = AgentLoopManager(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
@@ -1225,16 +1230,14 @@ class RayPPOTrainer:
                             del gen_baseline_batch, gen_baseline_output
 
                     batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                    )
+                            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                        )
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(
                         repeat_times=self.config.actor_rollout_ref.rollout.n, 
                         interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
                     )
-                    batch = batch.union(gen_batch_output)
-
-                    
+                    batch = batch.union(gen_batch_output)                    
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

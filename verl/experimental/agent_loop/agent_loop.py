@@ -217,7 +217,9 @@ class AgentLoopWorker:
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        print("DEBUG: local_path:", local_path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+        print("DEBUG: tokenizer:", self.tokenizer)
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -272,6 +274,7 @@ class AgentLoopWorker:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
         tasks = []
+
         agent_names = batch.non_tensor_batch["agent_name"]
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
         if "index" in batch.non_tensor_batch:
