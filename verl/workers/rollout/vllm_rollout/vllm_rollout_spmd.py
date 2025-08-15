@@ -48,27 +48,6 @@ import zmq
 from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
-
-# # Import aimv2 fix early to prevent duplicate registration issues
-# try:
-#     from verl.utils.aimv2_fix import apply_aimv2_fix
-#     apply_aimv2_fix()
-# except ImportError:
-#     # Fallback to direct patch if utils module is not available
-#     try:
-#         import transformers.models.auto.configuration_auto as config_auto
-#         original_register = config_auto.CONFIG_MAPPING.register
-        
-#         def patched_register(key, value, exist_ok=False):
-#             if key == "aimv2":
-#                 exist_ok = True
-#             return original_register(key, value, exist_ok=exist_ok)
-        
-#         config_auto.CONFIG_MAPPING.register = patched_register
-#     except Exception:
-#         pass
-
-# CRITICAL: Fix transformers/vllm aimv2 conflict before importing vllm
 try:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from transformers import AutoConfig
@@ -277,8 +256,8 @@ class vLLMRollout(BaseRollout):
         if not self.suffix_cache_data_path or not problem_ids:
             return {}
             
-        problem_id_to_sequences = []
-        
+        problem_id_to_sequences = {}
+
         # Check if the path exists
         if not os.path.exists(self.suffix_cache_data_path):
             print(f"Suffix cache data path does not exist: {self.suffix_cache_data_path}")
@@ -305,25 +284,25 @@ class vLLMRollout(BaseRollout):
                         try:                            
                             data = json.loads(line.strip())
                             # Only support token IDs format
-                            if 'output_token_ids' in data:
-                                # Data saved with save_token_ids=True
-                                output_data = data['output_token_ids']
-                                print(f"DEBUG: Loaded token IDs: {len(output_data)} tokens")
-                                problem_id_to_sequences.append(output_data)
-                            else:
-                                print(f"WARNING: No 'output_token_ids' field found in data: {list(data.keys())}. Only token IDs format is supported.")
-                                continue
+                            # if 'output_token_ids' in data:
+                            #     # Data saved with save_token_ids=True
+                            #     output_data = data['output_token_ids']
+                            #     print(f"DEBUG: Loaded token IDs: {len(output_data)} tokens")
+                            #     problem_id_to_sequences.append(output_data)
+                            # else:
+                            #     print(f"WARNING: No 'output_token_ids' field found in data: {list(data.keys())}. Only token IDs format is supported.")
+                            #     continue
                             # print("DEBUG:'problem_id' in data", 'problem_id' in data)
-                            # #print("DEBUG:'output' in data", 'output' in data)
-                            # if 'problem_id' in data and 'output' in data:
-                            #     problem_id = data['problem_id']
-                            #     if problem_id in problem_ids:
-                            #         #print("DEBUG:problem_id in problem_ids", problem_id)
-                            #         output_text = data['output']
-                            #         if problem_id not in problem_id_to_sequences:
-                            #             problem_id_to_sequences[problem_id] = []
-                            #         # Store the output text
-                            #         problem_id_to_sequences[problem_id].append(output_text)
+                            # print("DEBUG:'output' in data", 'output_token_ids' in data)
+                            if 'problem_id' in data and 'output_token_ids' in data:
+                                problem_id = data['problem_id']
+                                if problem_id in problem_ids:
+                                    #print("DEBUG:problem_id in problem_ids", problem_id)
+                                    output_text = data['output_token_ids']
+                                    if problem_id not in problem_id_to_sequences:
+                                        problem_id_to_sequences[problem_id] = []
+                                    # Store the output text
+                                    problem_id_to_sequences[problem_id].append(output_text)
                         except json.JSONDecodeError as e:
                             print(f"Failed to parse JSON line in {file_path}: {line.strip()}, error: {e}")
                             continue
@@ -395,6 +374,7 @@ class vLLMRollout(BaseRollout):
 
         # Extract problem_id if available
         problem_ids = non_tensor_batch.get("problem_id", None)
+        # print("DEBUG:in generate_sequences: problem_ids", problem_ids)
         
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
@@ -481,7 +461,6 @@ class vLLMRollout(BaseRollout):
                     
                     # Try to get Ray worker info if available
                     try:
-                        import ray
                         if ray.is_initialized():
                             worker_id = ray.get_runtime_context().get_worker_id()
                             node_id = ray.get_runtime_context().get_node_id()
@@ -499,14 +478,12 @@ class vLLMRollout(BaseRollout):
                     
                     # Process token IDs data for suffix cache
                     try:
-                        for output_index, token_ids in enumerate(problem_id_to_sequences):
-                            output_index += 1
-                            
-                            # Data is already token IDs, use directly
-                            print(f"DEBUG: Using token IDs directly: {len(token_ids)} tokens, first_10: {token_ids[:10]}")
-                            
-                            if token_ids:  # Only update if we have valid tokens
-                                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(req_id=-output_index-1, token_ids=token_ids)
+                        for output_index in range(len(unique_problem_ids)):
+                            seqs = problem_id_to_sequences[unique_problem_ids[output_index]]
+                            if seqs:
+                                for token_ids in seqs: # Only update if we have valid tokens
+                                    print(f"DEBUG: Updating suffix cache for problem_id: {unique_problem_ids[output_index]}")
+                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(req_id=unique_problem_ids[output_index], token_ids=token_ids)
                     except Exception as e:
                         print(f"Failed to update suffix cache: {e}")
                         #print("DEBUG: Tokenizer access failed:", e)
@@ -515,20 +492,27 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            # Use problem_id context manager from ArcticInference plugin if problem_ids provided
+            # Initialize context manager for problem_id to req_id mapping if problem_ids provided
             if problem_ids is not None:
                 try:
-                    # ArcticInference plugin provides ProblemIdContextManager
-                    from rllm.ArcticInference.arctic_inference.vllm.model_runner import ProblemIdContextManager
-                    with ProblemIdContextManager.batch_context(problem_ids):
-                        outputs = self.inference_engine.generate(
-                            prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                            sampling_params=self.sampling_params,
-                            lora_request=lora_requests,
-                            use_tqdm=False,
-                        )
+                    # Import ArcticInference plugin's ProblemIdContextManager
+                    from arctic_inference.vllm.model_runner import ProblemIdContextManager
+                    
+                    # Create empty req_id to problem_id mapping context
+                    ProblemIdContextManager.clear_req_id_mapping()
+                    ProblemIdContextManager.set_req_id_to_problem_id_mapping({})
+                    
+                    # Call generate with problem_ids parameter - LLM patches will handle the mapping
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=False,
+                        problem_ids=problem_ids,  # Pass problem_ids to generate method
+                    )
                 except ImportError:
                     # Fallback if ArcticInference plugin is not available
+                    print("Warning: ArcticInference plugin not available, problem_ids will be ignored")
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
                         sampling_params=self.sampling_params,
@@ -536,7 +520,7 @@ class vLLMRollout(BaseRollout):
                         use_tqdm=False,
                     )
             else:
-                # No problem_ids provided
+                # No problem_ids provided - use standard generate call
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.sampling_params,

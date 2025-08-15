@@ -658,7 +658,8 @@ class RayPPOTrainer:
                 "score": scores,
                 "step": [self.global_steps] * n,
             }
-
+        print("DEBUG:reward_extra_infos_dict[problem_id]", reward_extra_infos_dict["problem_id"])
+        print("DEBUG:len(reward_extra_infos_dict[problem_id]) == n", len(reward_extra_infos_dict["problem_id"]) == n)
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
@@ -1181,11 +1182,14 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("agent_name")
                 if "problem_id" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("problem_id")
+                else:
+                    print("DEBUG:problem_id not in batch.non_tensor_batch")
 
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -1193,11 +1197,10 @@ class RayPPOTrainer:
                     repeat_times=self.config.actor_rollout_ref.rollout.n, 
                     interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
                 )
-
-                # print("DEBUG:batch.non_tensor_batch[problem_id]", len(batch.non_tensor_batch["problem_id"]))
-                # inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                # print("DEBUG:input lengths", len(inputs))
-
+                print("DEBUG:gen_batch info:")
+                # print("  batch keys:", list(gen_batch.batch.keys()) if gen_batch.batch is not None else "None")
+                # print("  non_tensor_batch keys:", list(gen_batch.non_tensor_batch.keys()) if gen_batch.non_tensor_batch else "None")
+                # print("  meta_info keys:", list(gen_batch.meta_info.keys()) if gen_batch.meta_info else "None")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1237,7 +1240,8 @@ class RayPPOTrainer:
                         repeat_times=self.config.actor_rollout_ref.rollout.n, 
                         interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
                     )
-                    batch = batch.union(gen_batch_output)                    
+                    batch = batch.union(gen_batch_output) 
+                    batch.non_tensor_batch["problem_id"] = gen_batch.non_tensor_batch["problem_id"]                   
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1375,7 +1379,7 @@ class RayPPOTrainer:
                             if save_token_ids:
                                 # Save token IDs instead of decoded text
                                 inputs = batch.batch["prompts"].cpu().tolist()
-                                outputs = batch.batch["responses"].cpu().tolist()
+                                outputs = batch.batch["responses"].cpu().tolist()                    
                             else:
                                 # Save decoded text (original behavior)
                                 inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
@@ -1386,7 +1390,9 @@ class RayPPOTrainer:
                                     "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
                                 )
+                            print("DEBUG:batch.non_tensor_batch[problem_id]", len(batch.non_tensor_batch["problem_id"]))
                             if "problem_id" in batch.non_tensor_batch:
+                                print("DEBUG:batch.non_tensor_batch[problem_id] exist")
                                 reward_extra_infos_dict.setdefault(
                                     "problem_id", 
                                     batch.non_tensor_batch["problem_id"].tolist(),
