@@ -314,6 +314,27 @@ class vLLMRollout(BaseRollout):
           
         return problem_id_to_sequences
 
+    def get_prompt_token_ids(self, vllm_inputs, problem_id):
+        """
+        Get prompt token IDs for a specific problem_id from vllm_inputs.
+        
+        Args:
+            vllm_inputs (list): List of vllm input dictionaries, each containing:
+                - 'prompt_token_ids': List of token IDs for the prompt
+                - 'problem_id': Problem identifier
+                - 'multi_modal_data': Optional multi-modal data
+            problem_id: The problem ID to search for
+        
+        Returns:
+            list[int] or None: The prompt token IDs for the matching problem_id, or None if not found
+        """
+        for vllm_input in vllm_inputs:
+            if vllm_input.get("problem_id") == problem_id:
+                return vllm_input.get("prompt_token_ids")
+
+        print(f"DEBUG: No prompt token IDs found for problem_id: {problem_id}")
+        return None
+
     @contextmanager
     def update_sampling_params(self, **kwargs):
         # update sampling params
@@ -440,7 +461,6 @@ class vLLMRollout(BaseRollout):
                 unique_problem_ids = list(set(problem_ids))
                 
                 # Add more distinguishing information to avoid log aggregation
-                import os
                 worker_pid = os.getpid()
                 import socket
                 hostname = socket.gethostname()
@@ -474,16 +494,43 @@ class vLLMRollout(BaseRollout):
                     print(f"DEBUG: PID={worker_pid}, Host={hostname}, ERROR_GETTING_RANK={e}, unique_problem_ids: {unique_problem_ids}")
                 problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
                 if problem_id_to_sequences:
-                    logger.info(f"Loading suffix cache data for {len(problem_id_to_sequences)} problem IDs")
+                    print(f"DEBUG: Loading suffix cache data for {len(problem_id_to_sequences)} problem IDs")
                     
                     # Process token IDs data for suffix cache
                     try:
-                        for output_index in range(len(unique_problem_ids)):
-                            seqs = problem_id_to_sequences[unique_problem_ids[output_index]]
-                            if seqs:
-                                for token_ids in seqs: # Only update if we have valid tokens
-                                    print(f"DEBUG: Updating suffix cache for problem_id: {unique_problem_ids[output_index]}")
-                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(req_id=unique_problem_ids[output_index], token_ids=token_ids)
+                        print(f"DEBUG: 加载的problem_id_to_sequences: {len(problem_id_to_sequences)} items")
+                        
+                        for problem_id in unique_problem_ids:
+                            # 获取当前generate时会使用的实际prompt tokens (已去padding)
+                            raw_prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
+                            
+                            if raw_prompt_tokens is None:
+                                print(f"DEBUG: 没有找到prompt tokens for {problem_id}")
+                                continue
+                                
+                            print(f"DEBUG: 缓存prompt for {problem_id}, tokens长度: {len(raw_prompt_tokens)}")
+                            print(f"DEBUG: prompt开始tokens: {raw_prompt_tokens[:10]}")
+                            
+                            
+                            if problem_id in problem_id_to_sequences:
+                                seqs = problem_id_to_sequences[problem_id]
+                                print(f"DEBUG: 找到 {len(seqs)} 个cached sequences for {problem_id}")
+                                
+                                for i, token_ids in enumerate(seqs):
+                                    print(f"DEBUG: sequence {i}: 长度 {len(token_ids)}, 开始tokens: {token_ids[:10]}")
+                                                                # 缓存去padding后的prompt
+                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.cache_prompt(
+                                        req_id=-i-1, 
+                                        prompt_token_ids=raw_prompt_tokens
+                                    )
+                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(
+                                        req_id=-i-1, 
+                                        token_ids=token_ids
+                                    )
+                            else:
+                                print(f"DEBUG: 没有找到sequences for {problem_id}")
+                                
+                        #print(f"DEBUG: Cached prompt trees: {list(self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache._prompt_trees.keys())}")
                     except Exception as e:
                         print(f"Failed to update suffix cache: {e}")
                         #print("DEBUG: Tokenizer access failed:", e)
@@ -510,6 +557,8 @@ class vLLMRollout(BaseRollout):
                         use_tqdm=False,
                         problem_ids=problem_ids,  # Pass problem_ids to generate method
                     )
+                    
+
                 except ImportError:
                     # Fallback if ArcticInference plugin is not available
                     print("Warning: ArcticInference plugin not available, problem_ids will be ignored")
@@ -527,6 +576,32 @@ class vLLMRollout(BaseRollout):
                     lora_request=lora_requests,
                     use_tqdm=False,
                 )
+
+            # Output generation length statistics
+            total_generated_tokens = 0
+            generation_lengths = []
+            for i, output in enumerate(outputs):
+                for sample_id in range(len(output.outputs)):
+                    generated_length = len(output.outputs[sample_id].token_ids)
+                    generation_lengths.append(generated_length)
+                    total_generated_tokens += generated_length
+            
+            # Get rank information
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            else:
+                rank = int(os.environ.get("RANK", "0"))
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            
+            if generation_lengths:
+                avg_length = total_generated_tokens / len(generation_lengths)
+                min_length = min(generation_lengths)
+                max_length = max(generation_lengths)
+                print(f"[Rank {rank}/Local {local_rank}] Generation Length Stats: Total={total_generated_tokens}, "
+                      f"Count={len(generation_lengths)}, Avg={avg_length:.2f}, "
+                      f"Min={min_length}, Max={max_length}")
+                print(f"[Rank {rank}/Local {local_rank}] Individual lengths: {generation_lengths[:10]}..." if len(generation_lengths) > 10 else f"[Rank {rank}/Local {local_rank}] Individual lengths: {generation_lengths}")
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
