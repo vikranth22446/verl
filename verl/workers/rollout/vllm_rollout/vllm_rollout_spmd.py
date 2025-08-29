@@ -48,6 +48,7 @@ import zmq
 from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
+from tqdm import tqdm
 try:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from transformers import AutoConfig
@@ -509,24 +510,27 @@ class vLLMRollout(BaseRollout):
                                 continue
                                 
                             print(f"DEBUG: 缓存prompt for {problem_id}, tokens长度: {len(raw_prompt_tokens)}")
-                            print(f"DEBUG: prompt开始tokens: {raw_prompt_tokens[:10]}")
-                            
+                            print(f"DEBUG: prompt开始tokens: {raw_prompt_tokens[:10]}")                        
                             
                             if problem_id in problem_id_to_sequences:
                                 seqs = problem_id_to_sequences[problem_id]
                                 print(f"DEBUG: 找到 {len(seqs)} 个cached sequences for {problem_id}")
+                                from arctic_inference.common.suffix_cache import SuffixCache
+                                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(max_depth=32)
                                 
-                                for i, token_ids in enumerate(seqs):
-                                    print(f"DEBUG: sequence {i}: 长度 {len(token_ids)}, 开始tokens: {token_ids[:10]}")
+                                for i, token_ids in enumerate(tqdm(seqs, desc=f"Processing sequences for {problem_id}", leave=False)):
+                                    print(f"DEBUG: sequence {i}: 长度 {len(token_ids)}, 开始tokens: {raw_prompt_tokens[:10]}")
                                                                 # 缓存去padding后的prompt
-                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.cache_prompt(
+                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(
                                         req_id=-i-1, 
-                                        prompt_token_ids=raw_prompt_tokens
+                                        token_ids=raw_prompt_tokens
                                     )
                                     self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(
                                         req_id=-i-1, 
                                         token_ids=token_ids
                                     )
+                                    print(f"DEBUG: 更新了 {problem_id} 的 {i} 个token_ids")
+                                
                             else:
                                 print(f"DEBUG: 没有找到sequences for {problem_id}")
                                 
@@ -559,9 +563,9 @@ class vLLMRollout(BaseRollout):
                     )
                     
 
-                except ImportError:
-                    # Fallback if ArcticInference plugin is not available
-                    print("Warning: ArcticInference plugin not available, problem_ids will be ignored")
+                except (ImportError, TypeError):
+                    # Fallback if ArcticInference plugin is not available or LLM patches are disabled
+                    print("Warning: ArcticInference LLM plugin not available or disabled, problem_ids will be ignored")
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
                         sampling_params=self.sampling_params,

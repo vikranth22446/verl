@@ -1390,9 +1390,9 @@ class RayPPOTrainer:
                                     "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
                                 )
-                            print("DEBUG:batch.non_tensor_batch[problem_id]", len(batch.non_tensor_batch["problem_id"]))
+                            #print("DEBUG:batch.non_tensor_batch[problem_id]", len(batch.non_tensor_batch["problem_id"]))
                             if "problem_id" in batch.non_tensor_batch:
-                                print("DEBUG:batch.non_tensor_batch[problem_id] exist")
+                                #print("DEBUG:batch.non_tensor_batch[problem_id] exist")
                                 reward_extra_infos_dict.setdefault(
                                     "problem_id", 
                                     batch.non_tensor_batch["problem_id"].tolist(),
