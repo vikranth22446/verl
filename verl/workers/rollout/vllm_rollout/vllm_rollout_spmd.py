@@ -49,6 +49,10 @@ from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tqdm import tqdm
+
+# C++对象级锁定并行SuffixCache构建已集成到SuffixCache类中
+# 不再需要全局multiprocessing函数
+
 try:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from transformers import AutoConfig
@@ -84,6 +88,12 @@ from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+
+# Import SuffixCache for speculative decoding
+try:
+    from arctic_inference.common.suffix_cache import SuffixCache
+except ImportError:
+    SuffixCache = None
 
 import vllm
 vllm.plugins.load_general_plugins()
@@ -241,6 +251,15 @@ class vLLMRollout(BaseRollout):
         
         # Initialize suffix cache data storage path if available
         self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
+        
+        # Initialize speculative_config from engine_kwargs
+        # Check if speculative_config was passed in engine_kwargs
+        original_engine_kwargs = (
+            {}
+            if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs
+            else OmegaConf.to_container(config.engine_kwargs.vllm)
+        )
+        self.speculative_config = original_engine_kwargs.get("speculative_config", None)
         
         # Problem ID context manager is ready to use (no installation needed)
 
@@ -443,7 +462,6 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
-
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -453,98 +471,79 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
-        # Load and apply suffix cache bootstrap data if available
-        try:
-            suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+
+        if (self.speculative_config is not None and
+            self.speculative_config.get("enable_suffix_decoding", False)):
+            if self.speculative_config.get("method") not in (
+                    "arctic", "suffix", "mlp_speculator"):
+                raise ValueError(
+                    "Suffix decoding is only supported with the 'arctic', "
+                    "'mlp_speculator' or 'suffix' spec decoding methods.")
+            if SuffixCache is None:
+                raise ImportError("SuffixCache not available. Please install arctic_inference package.")
+            suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
+            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
+            # 🚀 启用C++对象级锁定+GIL释放的线程安全模式
+            self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
+                max_depth=suffix_cache_max_depth, 
+                thread_safe=True, 
+                max_threads=suffix_cache_max_threads
+            )            
             
-            if problem_ids is not None and suffix_cache is not None:
-                #print("DEBUG: Starting suffix cache bootstrap for problem_ids:", problem_ids[:3])
-                unique_problem_ids = list(set(problem_ids))
-                
-                # Add more distinguishing information to avoid log aggregation
-                worker_pid = os.getpid()
-                import socket
-                hostname = socket.gethostname()
-                
-                # Try to get GPU rank information
-                gpu_rank = "unknown"
-                local_rank = "unknown"
-                world_size = "unknown"
-                
-                try:
-                    # Check for CUDA_VISIBLE_DEVICES
-                    cuda_devices = os.environ.get('CUDA_VISIBLE_DEVICES', 'not_set')
-                    
-                    # Check for distributed training environment variables
-                    local_rank = os.environ.get('LOCAL_RANK', os.environ.get('SLURM_LOCALID', 'unknown'))
-                    world_size = os.environ.get('WORLD_SIZE', os.environ.get('SLURM_NTASKS', 'unknown'))
-                    gpu_rank = os.environ.get('RANK', os.environ.get('SLURM_PROCID', 'unknown'))
-                    
-                    # Try to get Ray worker info if available
-                    try:
-                        if ray.is_initialized():
-                            worker_id = ray.get_runtime_context().get_worker_id()
-                            node_id = ray.get_runtime_context().get_node_id()
-                            print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, RAY_WORKER={worker_id[:8]}, RAY_NODE={node_id[:8]}, unique_problem_ids: {unique_problem_ids}")
-                        else:
-                            print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, unique_problem_ids: {unique_problem_ids}")
-                    except:
-                        print(f"DEBUG: PID={worker_pid}, Host={hostname}, GPU_RANK={gpu_rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, CUDA_DEVICES={cuda_devices}, unique_problem_ids: {unique_problem_ids}")
-                        
-                except Exception as e:
-                    print(f"DEBUG: PID={worker_pid}, Host={hostname}, ERROR_GETTING_RANK={e}, unique_problem_ids: {unique_problem_ids}")
+            enable_suffix_prebuild = self.suffix_cache_data_path is not None
+
+            if enable_suffix_prebuild:
+                assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
+                unique_problem_ids = list(set(problem_ids))   
+                import time
+                total_start_time = time.perf_counter()       
                 problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
-                if problem_id_to_sequences:
-                    print(f"DEBUG: Loading suffix cache data for {len(problem_id_to_sequences)} problem IDs")
-                    
-                    # Process token IDs data for suffix cache
-                    try:
-                        print(f"DEBUG: 加载的problem_id_to_sequences: {len(problem_id_to_sequences)} items")
-                        
-                        for problem_id in unique_problem_ids:
-                            # 获取当前generate时会使用的实际prompt tokens (已去padding)
-                            raw_prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
-                            
-                            if raw_prompt_tokens is None:
-                                print(f"DEBUG: 没有找到prompt tokens for {problem_id}")
-                                continue
-                                
-                            print(f"DEBUG: 缓存prompt for {problem_id}, tokens长度: {len(raw_prompt_tokens)}")
-                            print(f"DEBUG: prompt开始tokens: {raw_prompt_tokens[:10]}")                        
-                            
-                            if problem_id in problem_id_to_sequences:
-                                seqs = problem_id_to_sequences[problem_id]
-                                print(f"DEBUG: 找到 {len(seqs)} 个cached sequences for {problem_id}")
-                                from arctic_inference.common.suffix_cache import SuffixCache
-                                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(max_depth=32)
-                                
-                                for i, token_ids in enumerate(tqdm(seqs, desc=f"Processing sequences for {problem_id}", leave=False)):
-                                    print(f"DEBUG: sequence {i}: 长度 {len(token_ids)}, 开始tokens: {raw_prompt_tokens[:10]}")
-                                                                # 缓存去padding后的prompt
-                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(
-                                        req_id=-i-1, 
-                                        token_ids=raw_prompt_tokens
-                                    )
-                                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.update_response(
-                                        req_id=-i-1, 
-                                        token_ids=token_ids
-                                    )
-                                    print(f"DEBUG: 更新了 {problem_id} 的 {i} 个token_ids")
-                                
-                            else:
-                                print(f"DEBUG: 没有找到sequences for {problem_id}")
-                                
-                        #print(f"DEBUG: Cached prompt trees: {list(self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache._prompt_trees.keys())}")
-                    except Exception as e:
-                        print(f"Failed to update suffix cache: {e}")
-                        #print("DEBUG: Tokenizer access failed:", e)
-        except Exception as e:
-            print(f"Skipping update suffix cache: {e}")
+                total_time = time.perf_counter() - total_start_time
+                print(f"DEBUG: 数据加载总耗时: {total_time:.4f}秒，处理了{len(unique_problem_ids)}个problem_ids")
+
+                assert problem_id_to_sequences is not None, "problem_id_to_sequences must be provided when enable_suffix_prebuild is True"
+                print(f"🚀 SuffixCache C++对象级锁定并行构建: {len(problem_id_to_sequences)} 个问题")
+                
+                # 获取suffix_cache引用（现在已经是线程安全模式）
+                suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                
+                # 🔥 准备并行批处理数据格式
+                problems_data = []
+                for problem_id in unique_problem_ids:
+                    if problem_id in problem_id_to_sequences:
+                        prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
+                        if prompt_tokens is not None:
+                            sequences = problem_id_to_sequences[problem_id]
+                            problems_data.append((problem_id, prompt_tokens, sequences))
+                
+                print(f"📊 准备并行处理: {len(problems_data)} 个问题, "
+                      f"总序列数: {sum(len(seqs) for _, _, seqs in problems_data)}")
+                
+                # ⚡ 使用C++对象级锁定+GIL释放的真正并行处理
+                import time
+                total_start_time = time.perf_counter()
+                
+                parallel_result = suffix_cache.prebuild_problems_parallel(problems_data)
+                
+                total_time = time.perf_counter() - total_start_time
+                
+                # 📈 性能报告
+                print(f"🎯 C++对象级锁定并行构建完成:")
+                print(f"  ✅ 成功问题: {parallel_result['successful_problems']}/{len(problems_data)}")
+                print(f"  ⚡ 总时间: {total_time:.4f}秒")
+                print(f"  🚀 实际加速: {parallel_result.get('actual_speedup', 'N/A')}x")
+                print(f"  🧵 活跃线程: {parallel_result.get('active_threads', 'N/A')}")
+                print(f"  🔒 技术: 每个SuffixTree独立C++锁+GIL释放")
+                
+                # 验证结果
+                cache_stats = suffix_cache.get_cache_stats()
+                print(f"  📊 最终统计: {cache_stats['problem_tree_count']} 个问题树, "
+                      f"{cache_stats['total_sequences']} 个序列")
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            # Initialize context manager for problem_id to req_id mapping if problem_ids provided
-            if problem_ids is not None:
+            if enable_suffix_prebuild:
+                # Initialize context manager for problem_id to req_id mapping if problem_ids provided
                 try:
                     # Import ArcticInference plugin's ProblemIdContextManager
                     from arctic_inference.vllm.model_runner import ProblemIdContextManager
@@ -561,7 +560,6 @@ class vLLMRollout(BaseRollout):
                         use_tqdm=False,
                         problem_ids=problem_ids,  # Pass problem_ids to generate method
                     )
-                    
 
                 except (ImportError, TypeError):
                     # Fallback if ArcticInference plugin is not available or LLM patches are disabled
@@ -572,8 +570,15 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=False,
                     )
+                    
+                # Clear suffix cache after generation to free up C++ memory
+                try:    
+                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.clear_all_cache()
+                except Exception as e:
+                    print(f"DEBUG: Failed to clear suffix cache: {e}")
             else:
-                # No problem_ids provided - use standard generate call
+                # Suffix cache not enabled or conditions not met - use simple generate call
+                print("DEBUG: Suffix cache conditions not met, using standard generate call")
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.sampling_params,
