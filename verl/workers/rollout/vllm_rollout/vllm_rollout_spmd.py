@@ -26,17 +26,19 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import atexit
 import json
 import logging
 import os
 import pickle
+import signal
 import socket
 import threading
 from contextlib import contextmanager
 from copy import deepcopy
 from types import MethodType
 from typing import Any
-
+import time
 # Problem ID context manager is available through ArcticInference plugin
 # No need to import manually - vllm.plugins.load_general_plugins() handles this
 
@@ -260,8 +262,62 @@ class vLLMRollout(BaseRollout):
             else OmegaConf.to_container(config.engine_kwargs.vllm)
         )
         self.speculative_config = original_engine_kwargs.get("speculative_config", None)
-        
+        self.enable_background_prebuilding = config.get("enable_background_suffix_prebuilding", False)
+        self.prebuild_next_iteration_background_thread_handle = None
+        self.generation_cache_store = {}  # generation_id -> suffix_cache
+        if self.enable_background_prebuilding:
+            threading_event = threading.Event()
+            self.prebuild_input_queue = threading.Queue(maxsize=10)
+            self.prebuild_output_queue = threading.Queue(maxsize=10)
+            self.prebuild_next_iteration_background_thread_handle = threading.Thread(
+                target=self.prebuild_next_iteration_background_thread,
+                args=(self.prebuild_input_queue, self.prebuild_output_queue, threading_event),
+                daemon=True
+            )
+            self.prebuild_next_iteration_background_thread_handle.start()
+            self.prebuild_thread_exit_flag = threading_event
+            
+            # Register cleanup handlers
+            atexit.register(self.stop_background_prebuilding)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+        self.suffix_generation_id = 0
         # Problem ID context manager is ready to use (no installation needed)
+
+    def stop_background_prebuilding(self):
+        """Stop the background prebuilding thread gracefully."""
+        if self.enable_background_prebuilding and self.prebuild_thread_exit_flag:
+            self.prebuild_thread_exit_flag.set()
+            if self.prebuild_next_iteration_background_thread_handle and self.prebuild_next_iteration_background_thread_handle.is_alive():
+                self.prebuild_next_iteration_background_thread_handle.join(timeout=5.0)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle signals to gracefully stop background thread."""
+        print(f"Received signal {signum}, stopping background prebuilding thread...")
+        self.stop_background_prebuilding()
+        if signum == signal.SIGTERM:
+            exit(0)
+    
+    def __del__(self):
+        """Cleanup when object is destroyed."""
+        self.stop_background_prebuilding()
+
+    def update_suffix_generation_id(self):
+        """Increment suffix generation ID and return new value."""
+        self.suffix_generation_id += 1
+        return self.suffix_generation_id
+
+    def prune_old_suffix_generation_cache(self, max_cache_generations=3):
+        """Clean up old cached generations to prevent memory growth."""
+        if len(self.generation_cache_store) > max_cache_generations:
+            oldest_gen = min(self.generation_cache_store.keys())
+            old_cache = self.generation_cache_store.pop(oldest_gen)
+            try:
+                old_cache.clear_all_cache()
+                del old_cache
+            except:
+                pass
+            logger.debug(f"Cleaned up old cache for generation {oldest_gen}")
 
     def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
         """
@@ -278,11 +334,10 @@ class vLLMRollout(BaseRollout):
             
         problem_id_to_sequences = {}
 
-        # Check if the path exists
         if not os.path.exists(self.suffix_cache_data_path):
             print(f"Suffix cache data path does not exist: {self.suffix_cache_data_path}")
             return {}
-        # Handle both directory and file paths
+
         files_to_process = []
         if os.path.isdir(self.suffix_cache_data_path):
             # Search for JSONL files in the directory
@@ -295,7 +350,6 @@ class vLLMRollout(BaseRollout):
         if not files_to_process:
             print(f"No JSONL files found in suffix cache data path: {self.suffix_cache_data_path}")
             return {}
-        #print("DEBUG:Files found:", files_to_process)
         try:
             for file_path in files_to_process:
                 print(f"Loading suffix cache data from: {file_path}")
@@ -303,21 +357,9 @@ class vLLMRollout(BaseRollout):
                     for line in f:
                         try:                            
                             data = json.loads(line.strip())
-                            # Only support token IDs format
-                            # if 'output_token_ids' in data:
-                            #     # Data saved with save_token_ids=True
-                            #     output_data = data['output_token_ids']
-                            #     print(f"DEBUG: Loaded token IDs: {len(output_data)} tokens")
-                            #     problem_id_to_sequences.append(output_data)
-                            # else:
-                            #     print(f"WARNING: No 'output_token_ids' field found in data: {list(data.keys())}. Only token IDs format is supported.")
-                            #     continue
-                            # print("DEBUG:'problem_id' in data", 'problem_id' in data)
-                            # print("DEBUG:'output' in data", 'output_token_ids' in data)
                             if 'problem_id' in data and 'output_token_ids' in data:
                                 problem_id = data['problem_id']
                                 if problem_id in problem_ids:
-                                    #print("DEBUG:problem_id in problem_ids", problem_id)
                                     output_text = data['output_token_ids']
                                     if problem_id not in problem_id_to_sequences:
                                         problem_id_to_sequences[problem_id] = []
@@ -329,9 +371,7 @@ class vLLMRollout(BaseRollout):
                         
         except Exception as e:
             print(f"Failed to load suffix cache data: {e}")
-            
         print(f"Loaded suffix cache data for {len(problem_id_to_sequences)} problem IDs from {len(files_to_process)} files")
-          
         return problem_id_to_sequences
 
     def get_prompt_token_ids(self, vllm_inputs, problem_id):
@@ -370,6 +410,47 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def generate_suffix_cache_for_problem_ids(self, vllm_inputs):
+        problem_ids = vllm_inputs.get("problem_id", None)
+        assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
+        assert SuffixCache is not None, "SuffixCache not available. Please install arctic_inference package."
+        assert self.speculative_config is not None, "speculative_config must be provided in engine_kwargs when enable_suffix_prebuild is True"
+        
+        suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
+        suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
+
+        unique_problem_ids = list(set(problem_ids))
+        suffix_cache =  SuffixCache(
+            max_depth=suffix_cache_max_depth, 
+            thread_safe=True, 
+            max_threads=suffix_cache_max_threads
+        )  
+
+        problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
+        assert problem_id_to_sequences is not None, "problem_id_to_sequences must be provided when enable_suffix_prebuild is True"
+        problems_data = []
+        for problem_id in unique_problem_ids:
+            if problem_id in problem_id_to_sequences:
+                prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
+                if prompt_tokens is not None:
+                    sequences = problem_id_to_sequences[problem_id]
+                    problems_data.append((problem_id, prompt_tokens, sequences))
+        suffix_cache.prebuild_problems_parallel(problems_data)
+        return suffix_cache
+ 
+    def prebuild_next_iteration_background_thread(self, prebuild_input_queue, prebuild_output_queue, exit_flag):
+        while not exit_flag.is_set():
+            try:
+                vllm_inputs, generation_id, context = prebuild_input_queue.get(timeout=1)  # Wait for 1 second for new input
+                if vllm_inputs is None:
+                    continue
+                suffix_cache = self.generate_suffix_cache_for_problem_ids(vllm_inputs)
+                prebuild_output_queue.put((suffix_cache, generation_id, context))
+            except Exception:
+                continue
+
+    
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -445,6 +526,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -470,8 +552,6 @@ class vLLMRollout(BaseRollout):
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
-
-
         if (self.speculative_config is not None and
             self.speculative_config.get("enable_suffix_decoding", False)):
             if self.speculative_config.get("method") not in (
@@ -481,65 +561,27 @@ class vLLMRollout(BaseRollout):
                     "'mlp_speculator' or 'suffix' spec decoding methods.")
             if SuffixCache is None:
                 raise ImportError("SuffixCache not available. Please install arctic_inference package.")
-            suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
-            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
-            # 🚀 启用C++对象级锁定+GIL释放的线程安全模式
-            self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
-                max_depth=suffix_cache_max_depth, 
-                thread_safe=True, 
-                max_threads=suffix_cache_max_threads
-            )            
+            suffix_cache = None 
+            if self.enable_background_prebuilding and not self.prebuild_output_queue.empty():
+                suffix_cache, cached_generation_id, cached_context = self.prebuild_output_queue.get()
+                if cached_generation_id != self.suffix_generation_id:
+                    logger.debug(f"DEBUG: Generation mismatch: expected {self.suffix_generation_id}, got {cached_generation_id} (context: {cached_context}). Storing for future use.")
+                    # Store cache for future generation instead of destroying it
+                    self.generation_cache_store[cached_generation_id] = suffix_cache
+                    suffix_cache = None
+            if suffix_cache is None:
+                # Check if we have a pre-built cache for current generation
+                if self.suffix_generation_id in self.generation_cache_store:
+                    suffix_cache = self.generation_cache_store.pop(self.suffix_generation_id)
+                    logger.debug(f"Using pre-built cache for generation {self.suffix_generation_id}")
+                else:
+                    suffix_cache = self.generate_suffix_cache_for_problem_ids(non_tensor_batch)
             
-            enable_suffix_prebuild = self.suffix_cache_data_path is not None
-
-            if enable_suffix_prebuild:
-                assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
-                unique_problem_ids = list(set(problem_ids))   
-                import time
-                total_start_time = time.perf_counter()       
-                problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
-                total_time = time.perf_counter() - total_start_time
-                print(f"DEBUG: 数据加载总耗时: {total_time:.4f}秒，处理了{len(unique_problem_ids)}个problem_ids")
-
-                assert problem_id_to_sequences is not None, "problem_id_to_sequences must be provided when enable_suffix_prebuild is True"
-                print(f"🚀 SuffixCache C++对象级锁定并行构建: {len(problem_id_to_sequences)} 个问题")
-                
-                # 获取suffix_cache引用（现在已经是线程安全模式）
-                suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
-                
-                # 🔥 准备并行批处理数据格式
-                problems_data = []
-                for problem_id in unique_problem_ids:
-                    if problem_id in problem_id_to_sequences:
-                        prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
-                        if prompt_tokens is not None:
-                            sequences = problem_id_to_sequences[problem_id]
-                            problems_data.append((problem_id, prompt_tokens, sequences))
-                
-                print(f"📊 准备并行处理: {len(problems_data)} 个问题, "
-                      f"总序列数: {sum(len(seqs) for _, _, seqs in problems_data)}")
-                
-                # ⚡ 使用C++对象级锁定+GIL释放的真正并行处理
-                import time
-                total_start_time = time.perf_counter()
-                
-                parallel_result = suffix_cache.prebuild_problems_parallel(problems_data)
-                
-                total_time = time.perf_counter() - total_start_time
-                
-                # 📈 性能报告
-                print(f"🎯 C++对象级锁定并行构建完成:")
-                print(f"  ✅ 成功问题: {parallel_result['successful_problems']}/{len(problems_data)}")
-                print(f"  ⚡ 总时间: {total_time:.4f}秒")
-                print(f"  🚀 实际加速: {parallel_result.get('actual_speedup', 'N/A')}x")
-                print(f"  🧵 活跃线程: {parallel_result.get('active_threads', 'N/A')}")
-                print(f"  🔒 技术: 每个SuffixTree独立C++锁+GIL释放")
-                
-                # 验证结果
-                cache_stats = suffix_cache.get_cache_stats()
-                print(f"  📊 最终统计: {cache_stats['problem_tree_count']} 个问题树, "
-                      f"{cache_stats['total_sequences']} 个序列")
-
+            self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = suffix_cache
+            
+            self.prune_old_suffix_generation_cache()
+            
+            enable_suffix_prebuild = self.suffix_cache_data_path is not None 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             if enable_suffix_prebuild:
@@ -559,7 +601,7 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=False,
                         problem_ids=problem_ids,  # Pass problem_ids to generate method
-                    )
+                    ) # type: ignore
 
                 except (ImportError, TypeError):
                     # Fallback if ArcticInference plugin is not available or LLM patches are disabled
@@ -578,7 +620,7 @@ class vLLMRollout(BaseRollout):
                     print(f"DEBUG: Failed to clear suffix cache: {e}")
             else:
                 # Suffix cache not enabled or conditions not met - use simple generate call
-                print("DEBUG: Suffix cache conditions not met, using standard generate call")
+                logger.debug("DEBUG: Suffix cache conditions not met, using standard generate call")
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.sampling_params,
@@ -594,7 +636,6 @@ class vLLMRollout(BaseRollout):
                     generated_length = len(output.outputs[sample_id].token_ids)
                     generation_lengths.append(generated_length)
                     total_generated_tokens += generated_length
-            
             # Get rank information
             if torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
@@ -671,6 +712,23 @@ class vLLMRollout(BaseRollout):
             batch["rollout_log_probs"] = rollout_log_probs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    def queue_suffix_prebuild_async(self, prompts, context="training", generation_id=None):
+        if not self.enable_background_prebuilding:
+            return
+        
+        # Use provided generation_id or fall back to current + 1
+        target_generation_id = generation_id if generation_id is not None else self.suffix_generation_id + 1
+        
+        try:
+            if not self.prebuild_input_queue.full():
+                self.prebuild_input_queue.put((
+                    prompts.non_tensor_batch, 
+                    target_generation_id,
+                    context
+                ), block=False)
+        except Exception as e:
+            logger.debug(f"Failed to queue {context} prebuilding: {e}")
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -777,6 +835,10 @@ class vLLMAsyncRollout:
         self.sharding_manager.__enter__()  # pylint: disable=C2801
         self.is_sleep = False
 
+    def queue_suffix_prebuild_async(self, prompts, context="training", generation_id=None):
+        """Delegate suffix prebuild queuing to the inference engine."""
+        self.inference_engine.queue_suffix_prebuild_async(prompts, context, generation_id)
+
     def execute_method(self, method: str | bytes, *args, **kwargs):
         if method == "init_worker":
             return self.init_worker(*args, **kwargs)
@@ -786,5 +848,7 @@ class vLLMAsyncRollout:
             return self.sleep(*args, **kwargs)
         elif method == "wake_up":
             return self.wake_up(*args, **kwargs)
+        elif method == "queue_suffix_prebuild_async":
+            return self.queue_suffix_prebuild_async(*args, **kwargs)
         else:
             return self.inference_engine.execute_method(method, *args, **kwargs)

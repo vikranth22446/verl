@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import itertools
 import json
 import os
 import uuid
@@ -387,6 +388,8 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        
+        self.current_suffix_gen_id = 0
 
     def _validate_config(self):
         config = self.config
@@ -763,6 +766,8 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            self.current_suffix_gen_id += 1
+            self.actor_rollout_wg.update_suffix_generation_id()
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -1109,6 +1114,65 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _prepare_generation_batch(self, batch_dict, global_steps):
+        batch: DataProto = DataProto.from_single_dict(batch_dict)
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        if "multi_modal_data" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("multi_modal_data")
+        if "raw_prompt" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        if "interaction_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+        if "index" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("index")
+        if "agent_name" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("agent_name")
+        if "problem_id" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("problem_id")
+
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+        gen_batch.meta_info["global_steps"] = global_steps
+        gen_batch = gen_batch.repeat(
+            repeat_times=self.config.actor_rollout_ref.rollout.n,
+            interleave=self.config.actor_rollout_ref.rollout.get("interleave", True),
+        )
+        return gen_batch
+    
+    
+    def will_validate_next_step(self, next_step):
+        return (self.config.trainer.test_freq > 0 and 
+                next_step % self.config.trainer.test_freq == 0)
+
+    def handle_background_suffix_prebuilding(self, prefetch_iter, first_val_batch, logger):
+        if not self.config.actor_rollout_ref.rollout.get("enable_background_suffix_prebuilding", False):
+            return 
+
+        next_batch_dict = next(prefetch_iter)
+        next_gen_batch = self._prepare_generation_batch(next_batch_dict, self.global_steps + 1)
+        
+        training_gen_id = self.current_suffix_gen_id + 1
+        validation_gen_id = self.current_suffix_gen_id + 2
+        
+        self.actor_rollout_wg.queue_suffix_prebuild_async(next_gen_batch, context="training", generation_id=training_gen_id)
+        
+        if not self.will_validate_next_step(self.global_steps + 1) or not first_val_batch:
+            return 
+            
+        val_gen_batch = self._prepare_generation_batch(first_val_batch, self.global_steps + 1)
+        val_gen_batch.meta_info["validate"] = True
+        
+        try:
+            self.actor_rollout_wg.queue_suffix_prebuild_async(val_gen_batch, context="validation", generation_id=validation_gen_id)
+        except Exception as e:
+            logger.debug(f"Failed to queue validation prebuilding: {e}")
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1149,6 +1213,16 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
+        prefetch_iter = None
+        first_val_batch = None
+        if self.config.actor_rollout_ref.rollout.get("enable_background_suffix_prebuilding", False):
+            train_cycle = itertools.cycle(self.train_dataloader)
+            prefetch_iter = iter(train_cycle)
+            next(prefetch_iter)
+            try:
+                first_val_batch = next(iter(self.val_dataloader))
+            except StopIteration:
+                first_val_batch = None
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1163,6 +1237,9 @@ class RayPPOTrainer:
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(do_profile)
 
+                self.handle_background_suffix_prebuilding(prefetch_iter, first_val_batch, logger)
+
+                gen_batch = self._prepare_generation_batch(batch_dict, self.global_steps)
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
@@ -1207,6 +1284,8 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        self.current_suffix_gen_id += 1
+                        self.actor_rollout_wg.update_suffix_generation_id()
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
@@ -1215,6 +1294,7 @@ class RayPPOTrainer:
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # WARN: ReMAX not supported for all the suffix decoding logic
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
