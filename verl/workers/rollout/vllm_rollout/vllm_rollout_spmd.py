@@ -58,6 +58,8 @@ from verl.workers.rollout.vllm_rollout.monkey_patch import (
     _validate_model_input,
 )
 import vllm
+vllm.plugins.load_general_plugins()
+
 from vllm import AsyncLLMEngine, LLM, LLMEngine, SamplingParams, TokensPrompt
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.engine.arg_utils import AsyncEngineArgs

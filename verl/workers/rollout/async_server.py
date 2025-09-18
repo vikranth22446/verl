@@ -387,6 +387,19 @@ class AsyncLLMServerManager:
         """Sleep all vllm instances."""
         ray.get([server.sleep.remote() for server in self.async_llm_servers])
 
+    def update_suffix_generation_id(self):
+        ray.get([server.update_suffix_generation_id.remote() for server in self.async_llm_servers])
+
+    def update_cache(self, problem_ids):
+        ray.get([server.update_cache.remote(problem_ids) for server in self.async_llm_servers])
+    
+    def set_hard_problems(self, hard_problems):
+        ray.get([server.set_hard_problems.remote(hard_problems) for server in self.async_llm_servers])
+
+    def queue_suffix_prebuild_async(self, batch: DataProto, context: str, generation_id: int):
+        for server in self.async_llm_servers:
+            server.queue_suffix_prebuild_async.remote(batch, context, generation_id)
+
     def submit_chat_completions(
         self,
         callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None],

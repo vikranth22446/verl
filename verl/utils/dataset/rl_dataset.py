@@ -132,7 +132,7 @@ class RLHFDataset(Dataset):
             try:
                 dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
             except Exception as e:
-                print(f"Error loading parquet file {parquet_file}: {str(e)}")
+                # print(f"Error loading parquet file {parquet_file}: {str(e)}")
                 import polars as pl
                 dataframe = pl.read_parquet(parquet_file)
                 dataframe = dataframe.to_pandas()
@@ -260,7 +260,6 @@ class RLHFDataset(Dataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
-
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
@@ -296,6 +295,7 @@ class RLHFDataset(Dataset):
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
+        row_dict["problem_id"] = row_dict.get("extra_info").get("problem_id")
         return row_dict
 
     def __getstate__(self):

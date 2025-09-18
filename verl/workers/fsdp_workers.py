@@ -919,8 +919,11 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
-            self.ref_policy.actor_module._handle.reshard(True)
+        if self.world_size > 1:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
 
         return output
 
