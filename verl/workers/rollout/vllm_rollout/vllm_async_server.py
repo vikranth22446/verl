@@ -14,6 +14,9 @@
 import logging
 from collections.abc import AsyncGenerator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from collections.abc import Sequence as GenericSequence
+from vllm.sequence import Logprob
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 import time
 import cloudpickle
 import ray
@@ -29,7 +32,7 @@ vllm.plugins.load_general_plugins()
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse, ErrorResponse
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse, ErrorResponse, CompletionLogProbs
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
@@ -138,7 +141,7 @@ class ExternalRayDistributedExecutor(Executor):
 
 class OpenAIServingChatCompletionsWithProblemID(OpenAIServingCompletion):
     """Extension of OpenAIServingChat to handle problem_ids."""
-
+    
     async def create_completion(
         self,
         request: CompletionRequest,
@@ -246,6 +249,9 @@ class OpenAIServingChatCompletionsWithProblemID(OpenAIServingCompletion):
                     sampling_params = request.to_sampling_params(
                         max_tokens, self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
+                
+                # DEBUG: Log skip_special_tokens parameter
+                logging.info(f"SamplingParams created: skip_special_tokens={sampling_params.skip_special_tokens}")
 
                 request_id_item = f"{request_id}-{i}"
 
@@ -379,18 +385,40 @@ class SuffixCacheManager:
         return (self.speculative_config and 
                 self.speculative_config.get("enable_suffix_decoding", False))
     
-    def prepare_suffix_cache(self, problem_ids):
+    async def prepare_suffix_cache(self, problem_ids):
         if not self.should_use_suffix_cache():
             return None
         if self.suffix_generation_id in self.generation_cache_store:
             print("Reusing existing suffix cache for generation_id:", self.suffix_generation_id)
             return self.generation_cache_store.pop(self.suffix_generation_id)
         print("Cache Miss: Building new suffix cache for generation_id:", self.suffix_generation_id)
-        suffix_cache = self._build_suffix_cache(problem_ids)
+        suffix_cache = await self._build_suffix_cache(problem_ids)
         self.generation_cache_store[self.suffix_generation_id] = suffix_cache
         return suffix_cache
+
+    async def prepare_cache_data(self, problem_ids):
+        """Prepare cache data (not objects) for distribution to workers"""
+        if self.suffix_generation_id in self.generation_cache_store:
+            return self.generation_cache_store.pop(self.suffix_generation_id)
+        
+        cache_data = self._prepare_cache_data(problem_ids)
+        self.generation_cache_store[self.suffix_generation_id] = cache_data
+        return cache_data
+
+    def _prepare_cache_data(self, problem_ids):
+        """Convert problem_ids to cache data format"""
+        problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(problem_ids)
+        return [(pid, None, seqs) for pid, seqs in problem_id_to_sequences.items()]
+
+    def _get_cache_params(self):
+        """Get cache parameters for worker initialization"""
+        return {
+            "max_depth": self.speculative_config.get("suffix_cache_max_depth", 64),
+            "thread_safe": True,
+            "max_threads": self.speculative_config.get("suffix_cache_max_threads", 8)
+        }
     
-    def _build_suffix_cache(self, problem_ids):
+    async def _build_suffix_cache(self, problem_ids):
         if SuffixCache is None:
             return None
         
@@ -415,7 +443,8 @@ class SuffixCacheManager:
                 problems_data.append((problem_id, None, sequences))
         
         if problems_data:
-            suffix_cache.prebuild_problems_parallel(problems_data)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, suffix_cache.prebuild_problems_parallel, problems_data)
         
         return suffix_cache
     
@@ -506,6 +535,7 @@ class AsyncvLLMServer(AsyncServerBase):
         trust_remote_code = config.model.get("trust_remote_code", False)
         rollout_config = config.rollout
 
+
         if self.enable_lmcache:
             self._setup_lmcache_config()
 
@@ -525,6 +555,8 @@ class AsyncvLLMServer(AsyncServerBase):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = rollout_config.get(k)
         print(f"override_generation_config: {kwargs}")
+        # Note: added for suffix cache
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         engine_kwargs = {
             "model": local_path,
@@ -724,19 +756,41 @@ class AsyncvLLMServer(AsyncServerBase):
         return self.suffix_cache_manager.update_suffix_generation_id()
 
     async def update_cache(self, problem_ids):
-        if self.suffix_cache_manager.should_use_suffix_cache():
-            suffix_cache = self.suffix_cache_manager.prepare_suffix_cache(problem_ids)
-            if suffix_cache:
+        if not self.suffix_cache_manager.should_use_suffix_cache():
+            return {"status": "success"}
+        
+        current_gen_id = self.suffix_cache_manager.update_suffix_generation_id()
+        
+        if current_gen_id in self.suffix_cache_manager.generation_cache_store:
+            cached_data = self.suffix_cache_manager.generation_cache_store.pop(current_gen_id)
+            if isinstance(cached_data, dict) and 'cache_params' in cached_data:
                 try:
-                    await self.engine.collective_rpc("model_runner.set_suffix_cache", args=(suffix_cache,))
+                    await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cached_data['cache_params'], cached_data['problems_data']))
+                    return {"status": "success"}
                 except Exception as e:
-                    logger.error(f"Failed to set suffix cache via collective_rpc: {e}")
+                    logger.error(f"Failed to rebuild cache from stored data: {e}")
                     return {"status": "error", "message": str(e)}
-        return {"status": "success"}
+        
+        try:
+            results = await self.engine.collective_rpc("activate_prebuilt_cache", args=(current_gen_id,))
+            if all(results):
+                return {"status": "success"}
+        except Exception as e:
+            logger.warning(f"Failed to activate prebuilt cache: {e}. Falling back to sync build.")
+        
+        cache_params = self.suffix_cache_manager._get_cache_params()
+        problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
+        
+        try:
+            await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cache_params, problems_data))
+            return {"status": "success"}
+        except Exception as e:
+            logger.error(f"Failed to rebuild cache via collective_rpc: {e}")
+            return {"status": "error", "message": str(e)}
     
     async def set_hard_problems(self, hard_problems):
         try:
-            await self.engine.collective_rpc("model_runner.set_hard_problems", args=(hard_problems,))
+            await self.engine.collective_rpc("set_hard_problems", args=(hard_problems,))
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Failed to set hard problems via collective_rpc: {e}")
@@ -750,7 +804,7 @@ class AsyncvLLMServer(AsyncServerBase):
         }
         """
         try:
-            metrics = await self.engine.collective_rpc("model_runner.get_acceptance_length_metric_for_problems", args=(problem_ids,))
+            metrics = await self.engine.collective_rpc("get_acceptance_length_metric_for_problems", args=(problem_ids,))
             return {"status": "success", "metrics": metrics}
         except Exception as e:
             logger.error(f"Failed to get acceptance length metrics for problems via collective_rpc: {e}")
@@ -758,7 +812,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
     async def clear_acceptance_metrics_for_problems(self, problem_ids):
         try:
-            await self.engine.collective_rpc("model_runner.clear_acceptance_metrics_for_problems", args=(problem_ids,))
+            await self.engine.collective_rpc("clear_acceptance_metrics_for_problems", args=(problem_ids,))
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Failed to clear acceptance metrics for problems via collective_rpc: {e}")
@@ -767,12 +821,15 @@ class AsyncvLLMServer(AsyncServerBase):
     async def queue_suffix_prebuild_async(self, batch, context: str, generation_id: int=None):
         """Queue suffix prebuilding work for background processing."""
         logger.info(f"queue_suffix_prebuild_async called: context={context}, generation_id={generation_id}")
-        logger.info(f"batch type: {type(batch)}, has non_tensor_batch: {hasattr(batch, 'non_tensor_batch')}")
         problem_ids = batch.non_tensor_batch.get("problem_id", None) if hasattr(batch, 'non_tensor_batch') else None
-        print("RUNNING queue_suffix_prebuild_async", context, generation_id, problem_ids)
         if problem_ids is not None:
-            logger.info(f"Starting async suffix prebuild task for {len(problem_ids)} problem_ids")
-            suffix_cache = self.suffix_cache_manager._build_suffix_cache(problem_ids)
-            self.suffix_cache_manager.generation_cache_store[generation_id] = suffix_cache
-            logger.info(f"Background suffix prebuild completed for context={context}, generation_id={generation_id}, problem_ids={len(problem_ids)}")
-            print("Completed queue_suffix_prebuild_async", context, generation_id, problem_ids)
+            cache_params = self.suffix_cache_manager._get_cache_params()
+            problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
+            
+            self.suffix_cache_manager.generation_cache_store[generation_id] = {
+                'cache_params': cache_params,
+                'problems_data': problems_data
+            }
+            
+            await self.engine.collective_rpc("prebuild_cache_async", args=(generation_id, cache_params, problems_data))
+            logger.info(f"Background prebuild queued for generation_id={generation_id}, problem_ids={len(problem_ids)}")
