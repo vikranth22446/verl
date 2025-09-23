@@ -376,6 +376,7 @@ class SuffixCacheManager:
         self.generation_cache_store = {}
         self.speculative_config = config.get("engine_kwargs", {}).get("vllm", {}).get("speculative_config", None)
         self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
+        self.baseline_suffix_cache = config.get("baseline_suffix_cache", False)
         
     def update_suffix_generation_id(self):
         self.suffix_generation_id += 1
@@ -407,6 +408,8 @@ class SuffixCacheManager:
 
     def _prepare_cache_data(self, problem_ids):
         """Convert problem_ids to cache data format"""
+        if self.baseline_suffix_cache:
+            return []
         problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(problem_ids)
         return [(pid, None, seqs) for pid, seqs in problem_id_to_sequences.items()]
 
@@ -427,25 +430,28 @@ class SuffixCacheManager:
 
         unique_problem_ids = list(set(problem_ids))
         suffix_cache = SuffixCache(
-            max_depth=suffix_cache_max_depth, 
-            thread_safe=True, 
+            max_depth=suffix_cache_max_depth,
+            thread_safe=True,
             max_threads=suffix_cache_max_threads
         )
-        
+
+        if self.baseline_suffix_cache:
+            return suffix_cache
+
         problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
         if not problem_id_to_sequences:
             return suffix_cache
-            
+
         problems_data = []
         for problem_id in unique_problem_ids:
             if problem_id in problem_id_to_sequences:
                 sequences = problem_id_to_sequences[problem_id]
                 problems_data.append((problem_id, None, sequences))
-        
+
         if problems_data:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, suffix_cache.prebuild_problems_parallel, problems_data)
-        
+
         return suffix_cache
     
     def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
@@ -758,9 +764,9 @@ class AsyncvLLMServer(AsyncServerBase):
     async def update_cache(self, problem_ids):
         if not self.suffix_cache_manager.should_use_suffix_cache():
             return {"status": "success"}
-        
+
         current_gen_id = self.suffix_cache_manager.update_suffix_generation_id()
-        
+
         if current_gen_id in self.suffix_cache_manager.generation_cache_store:
             cached_data = self.suffix_cache_manager.generation_cache_store.pop(current_gen_id)
             if isinstance(cached_data, dict) and 'cache_params' in cached_data:
@@ -770,17 +776,17 @@ class AsyncvLLMServer(AsyncServerBase):
                 except Exception as e:
                     logger.error(f"Failed to rebuild cache from stored data: {e}")
                     return {"status": "error", "message": str(e)}
-        
+
         try:
             results = await self.engine.collective_rpc("activate_prebuilt_cache", args=(current_gen_id,))
             if all(results):
                 return {"status": "success"}
         except Exception as e:
             logger.warning(f"Failed to activate prebuilt cache: {e}. Falling back to sync build.")
-        
+
         cache_params = self.suffix_cache_manager._get_cache_params()
         problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
-        
+
         try:
             await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cache_params, problems_data))
             return {"status": "success"}

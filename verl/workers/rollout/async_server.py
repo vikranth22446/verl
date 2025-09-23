@@ -431,7 +431,7 @@ class AsyncLLMServerManager:
             problem_metrics[problem_id]['avg_acceptance_length'] = sum(lengths) / len(lengths)
 
         return {
-            'avg_acceptance_length': sum(all_acceptance_lengths) / len(all_acceptance_lengths),
+            'avg_acceptance_length': sum(all_acceptance_lengths) / len(all_acceptance_lengths) if len(all_acceptance_lengths) > 0 else 0,
             'problem_metrics': problem_metrics
         }
     
