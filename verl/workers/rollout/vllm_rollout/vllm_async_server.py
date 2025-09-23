@@ -805,7 +805,7 @@ class AsyncvLLMServer(AsyncServerBase):
         """
         try:
             metrics = await self.engine.collective_rpc("get_acceptance_length_metric_for_problems", args=(problem_ids,))
-            return {"status": "success", "metrics": metrics}
+            return metrics
         except Exception as e:
             logger.error(f"Failed to get acceptance length metrics for problems via collective_rpc: {e}")
             return {"status": "error", "message": str(e)}
