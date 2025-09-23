@@ -410,6 +410,11 @@ class AsyncLLMServerManager:
         problem_metrics = {}
 
         for result in results:
+            if not isinstance(result, dict) or 'problem_metrics' not in result:
+                continue
+            if not isinstance(result['problem_metrics'], dict):
+                continue
+
             all_acceptance_lengths.extend([
                 length for metrics in result['problem_metrics'].values()
                 for length in metrics['acceptance_length']
