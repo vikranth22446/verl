@@ -399,7 +399,42 @@ class AsyncLLMServerManager:
     def queue_suffix_prebuild_async(self, batch: DataProto, context: str, generation_id: int):
         for server in self.async_llm_servers:
             server.queue_suffix_prebuild_async.remote(batch, context, generation_id)
+    
+    async def get_acceptance_length_metric_for_problems(self, problem_ids: List[int]) -> Dict:
+        results = await asyncio.gather(*[
+            server.get_acceptance_length_metric_for_problems.remote(problem_ids)
+            for server in self.async_llm_servers
+        ])
 
+        all_acceptance_lengths = []
+        problem_metrics = {}
+
+        for result in results:
+            if not isinstance(result, dict) or 'problem_metrics' not in result:
+                continue
+            if not isinstance(result['problem_metrics'], dict):
+                continue
+
+            all_acceptance_lengths.extend([
+                length for metrics in result['problem_metrics'].values()
+                for length in metrics['acceptance_length']
+            ])
+
+            for problem_id, metrics in result['problem_metrics'].items():
+                if problem_id not in problem_metrics:
+                    problem_metrics[problem_id] = {'acceptance_length': []}
+                problem_metrics[problem_id]['acceptance_length'].extend(metrics['acceptance_length'])
+
+        # Calculate averages once at the end
+        for problem_id in problem_metrics:
+            lengths = problem_metrics[problem_id]['acceptance_length']
+            problem_metrics[problem_id]['avg_acceptance_length'] = sum(lengths) / len(lengths)
+
+        return {
+            'avg_acceptance_length': sum(all_acceptance_lengths) / len(all_acceptance_lengths) if len(all_acceptance_lengths) > 0 else 0,
+            'problem_metrics': problem_metrics
+        }
+    
     def submit_chat_completions(
         self,
         callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None],
