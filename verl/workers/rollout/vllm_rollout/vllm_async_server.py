@@ -32,7 +32,7 @@ vllm.plugins.load_general_plugins()
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse, ErrorResponse, CompletionLogProbs
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse, ErrorResponse, CompletionLogProbs, CompletionResponseChoice, UsageInfo
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
@@ -63,6 +63,22 @@ from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
 import jinja2
 import asyncio
 logger = logging.getLogger(__file__)
+
+
+class SafeCompletionResponseChoice(CompletionResponseChoice):
+    def __init__(self, *, index: int, text: str, finish_reason: Optional[str] = None, 
+                 stop_reason: Union[int, str, None] = None, token_ids: Optional[List[int]] = None, **extra_data: Any):
+        super().__init__(
+            index=index,
+            text=text, 
+            logprobs=None,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+            prompt_logprobs=None,
+            **extra_data
+        )
+        self.token_ids = token_ids
+
 
 try:
     from arctic_inference.common.suffix_cache import SuffixCache
@@ -341,14 +357,34 @@ class OpenAIServingChatCompletionsWithProblemID(OpenAIServingCompletion):
             final_res_batch_checked = cast(list[RequestOutput],
                                            final_res_batch)
 
-            response = self.request_output_to_completion_response(
-                final_res_batch_checked,
-                request,
-                request_id,
-                created_time,
-                model_name,
-                tokenizer,
-                request_metadata,
+            choices = []
+            for i, final_res in enumerate(final_res_batch_checked):
+                completion_output = final_res.outputs[0]
+                choice = SafeCompletionResponseChoice(
+                    index=i,
+                    text=completion_output.text,
+                    finish_reason=completion_output.finish_reason,
+                    stop_reason=completion_output.stop_reason,
+                    token_ids=list(completion_output.token_ids)
+                )
+                choices.append(choice)
+
+            total_tokens = sum(len(choice.token_ids) if choice.token_ids else 0 for choice in choices)
+            prompt_tokens = sum(len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0 for final_res in final_res_batch_checked)
+            
+            usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=total_tokens,
+                total_tokens=prompt_tokens + total_tokens
+            )
+            
+            response = CompletionResponse(
+                id=request_id,
+                choices=choices,
+                created=created_time,
+                model=model_name,
+                object="text_completion",
+                usage=usage,
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
