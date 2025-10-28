@@ -392,7 +392,11 @@ class AsyncLLMServerManager:
 
     def update_cache(self, problem_ids):
         ray.get([server.update_cache.remote(problem_ids) for server in self.async_llm_servers])
-    
+
+    def store_rollouts(self, problem_sequences, generation_step):
+        """Store rollout sequences for suffix cache."""
+        ray.get([server.store_rollouts.remote(problem_sequences, generation_step) for server in self.async_llm_servers])
+
     def set_hard_problems(self, hard_problems):
         ray.get([server.set_hard_problems.remote(hard_problems) for server in self.async_llm_servers])
 
