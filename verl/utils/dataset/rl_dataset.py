@@ -295,7 +295,9 @@ class RLHFDataset(Dataset):
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
-        row_dict["problem_id"] = row_dict.get("extra_info").get("problem_id")
+        # problem_id from dataset; fallback to index for datasets (e.g. codeforces) that lack problem_id
+        extra_info = row_dict.get("extra_info")
+        row_dict["problem_id"] = (extra_info.get("problem_id") or index) if isinstance(extra_info, dict) else index
         return row_dict
 
     def __getstate__(self):

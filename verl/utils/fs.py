@@ -213,6 +213,12 @@ def copy_local_path_from_hdfs(src: str, cache_dir=None, filelock=".file.lock", v
     """Deprecated. Please use copy_to_local instead."""
     from filelock import FileLock
 
+    if src is None:
+        raise ValueError(
+            "Source path is None. This usually means the dataset's get_verl_data_path() returned None. "
+            "Ensure your dataset is registered (DatasetRegistry.register_dataset) or loaded from a file path "
+            "so a Verl-parquet can be created."
+        )
     assert src[-1] != "/", f"Make sure the last char in src is not / because it will cause error. Got {src}"
 
     if is_non_local(src):

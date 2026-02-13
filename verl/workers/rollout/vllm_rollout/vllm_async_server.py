@@ -798,14 +798,29 @@ class AsyncvLLMServer(AsyncServerBase):
 
         API reference: https://platform.openai.com/docs/api-reference/completions/create
         """
-        request_json = await raw_request.json()
-        problem_id = request_json.get('problem_id', None)
-        if problem_id is None:
-            print(f"No problem_id completion found in request, {request_json.keys()}")
+        import traceback
+        request_json = None
+        try:
+            request_json = await raw_request.json()
+            problem_id = request_json.get('problem_id', None)
+            if problem_id is None:
+                print(f"No problem_id completion found in request, {request_json.keys()}")
+            
+            request = CompletionRequest(**request_json)
+            generator = await self.openai_serving_completion.create_completion(request, raw_request, problem_id=problem_id)
+        except Exception as e:
+            problem_id_val = request_json.get('problem_id', '?') if request_json else '?'
+            logger.error(
+                "[vLLM completions] Server-side error - problem_id=%s | %s",
+                problem_id_val,
+                str(e),
+                exc_info=True,
+            )
+            return JSONResponse(
+                content={"error": str(e), "detail": traceback.format_exc()},
+                status_code=500,
+            )
         
-        request = CompletionRequest(**request_json)
-        generator = await self.openai_serving_completion.create_completion(request, raw_request, problem_id=problem_id)
-
         if isinstance(generator, ErrorResponse):
             return JSONResponse(content=generator.model_dump(), status_code=generator.code)
         if request.stream:
