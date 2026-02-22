@@ -899,25 +899,30 @@ class AsyncvLLMServer(AsyncServerBase):
 
         current_gen_id = self.suffix_cache_manager.update_suffix_generation_id()
 
+        # Pop cached_data if present (from queue_suffix_prebuild_async)
+        cached_data = None
         if current_gen_id in self.suffix_cache_manager.generation_cache_store:
             cached_data = self.suffix_cache_manager.generation_cache_store.pop(current_gen_id)
-            if isinstance(cached_data, dict) and 'cache_params' in cached_data:
-                try:
-                    await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cached_data['cache_params'], cached_data['problems_data']))
-                    return {"status": "success"}
-                except Exception as e:
-                    logger.error(f"Failed to rebuild cache from stored data: {e}")
-                    return {"status": "error", "message": str(e)}
+            if not (isinstance(cached_data, dict) and 'cache_params' in cached_data):
+                cached_data = None
 
+        # First try activate_prebuilt_cache (use prebuilt result from workers if ready)
         try:
             results = await self.engine.collective_rpc("activate_prebuilt_cache", args=(current_gen_id,))
             if all(results):
+                logger.info(f"Activated prebuilt cache for generation_id={current_gen_id}")
                 return {"status": "success"}
         except Exception as e:
             logger.warning(f"Failed to activate prebuilt cache: {e}. Falling back to sync build.")
 
-        cache_params = self.suffix_cache_manager._get_cache_params()
-        problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
+        # Fallback: rebuild_cache_sync (use cached_data if available, else prepare fresh)
+        if cached_data is not None:
+            cache_params = cached_data['cache_params']
+            problems_data = cached_data['problems_data']
+            logger.info(f"Rebuilding cache from stored data for generation_id={current_gen_id} (prebuild not ready)")
+        else:
+            cache_params = self.suffix_cache_manager._get_cache_params()
+            problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
 
         try:
             await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cache_params, problems_data))
