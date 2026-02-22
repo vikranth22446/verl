@@ -157,7 +157,11 @@ class ExternalRayDistributedExecutor(Executor):
 
 class OpenAIServingChatCompletionsWithProblemID(OpenAIServingCompletion):
     """Extension of OpenAIServingChat to handle problem_ids."""
-    
+
+    def __init__(self, *args, verbose_received_request_log: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.verbose_received_request_log = verbose_received_request_log
+
     async def create_completion(
         self,
         request: CompletionRequest,
@@ -267,15 +271,16 @@ class OpenAIServingChatCompletionsWithProblemID(OpenAIServingCompletion):
                         self.default_sampling_params)
                 
                 # DEBUG: Log skip_special_tokens parameter
-                logging.info(f"SamplingParams created: skip_special_tokens={sampling_params.skip_special_tokens}")
+                #logging.info(f"SamplingParams created: skip_special_tokens={sampling_params.skip_special_tokens}")
 
                 request_id_item = f"{request_id}-{i}"
 
-                self._log_inputs(request_id_item,
-                                 request_prompts[i],
-                                 params=sampling_params,
-                                 lora_request=lora_request,
-                                 prompt_adapter_request=prompt_adapter_request)
+                if self.verbose_received_request_log:
+                    self._log_inputs(request_id_item,
+                                     request_prompts[i],
+                                     params=sampling_params,
+                                     lora_request=lora_request,
+                                     prompt_adapter_request=prompt_adapter_request)
 
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
@@ -443,25 +448,25 @@ class SuffixCacheManager:
         return (self.speculative_config and 
                 self.speculative_config.get("enable_suffix_decoding", False))
     
-    async def prepare_suffix_cache(self, problem_ids):
-        if not self.should_use_suffix_cache():
-            return None
-        if self.suffix_generation_id in self.generation_cache_store:
-            print("Reusing existing suffix cache for generation_id:", self.suffix_generation_id)
-            return self.generation_cache_store.pop(self.suffix_generation_id)
-        print("Cache Miss: Building new suffix cache for generation_id:", self.suffix_generation_id)
-        suffix_cache = await self._build_suffix_cache(problem_ids)
-        self.generation_cache_store[self.suffix_generation_id] = suffix_cache
-        return suffix_cache
+    # async def prepare_suffix_cache(self, problem_ids):
+    #     if not self.should_use_suffix_cache():
+    #         return None
+    #     if self.suffix_generation_id in self.generation_cache_store:
+    #         print("Reusing existing suffix cache for generation_id:", self.suffix_generation_id)
+    #         return self.generation_cache_store.pop(self.suffix_generation_id)
+    #     print("Cache Miss: Building new suffix cache for generation_id:", self.suffix_generation_id)
+    #     suffix_cache = await self._build_suffix_cache(problem_ids)
+    #     self.generation_cache_store[self.suffix_generation_id] = suffix_cache
+    #     return suffix_cache
 
-    async def prepare_cache_data(self, problem_ids):
-        """Prepare cache data (not objects) for distribution to workers"""
-        if self.suffix_generation_id in self.generation_cache_store:
-            return self.generation_cache_store.pop(self.suffix_generation_id)
+    # async def prepare_cache_data(self, problem_ids):
+    #     """Prepare cache data (not objects) for distribution to workers"""
+    #     if self.suffix_generation_id in self.generation_cache_store:
+    #         return self.generation_cache_store.pop(self.suffix_generation_id)
         
-        cache_data = self._prepare_cache_data(problem_ids)
-        self.generation_cache_store[self.suffix_generation_id] = cache_data
-        return cache_data
+    #     cache_data = self._prepare_cache_data(problem_ids)
+    #     self.generation_cache_store[self.suffix_generation_id] = cache_data
+    #     return cache_data
 
     def _prepare_cache_data(self, problem_ids):
         """Convert problem_ids to cache data format using in-memory rollout storage"""
@@ -548,12 +553,15 @@ class SuffixCacheManager:
         return suffix_cache
     
     def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
-        if not self.suffix_cache_data_path or not problem_ids:
+        if not self.suffix_cache_data_path or problem_ids is None or len(problem_ids) == 0:
             return {}
             
         problem_id_to_sequences = {}
         if not os.path.exists(self.suffix_cache_data_path):
             return {}
+        
+        # Normalize problem_ids to strings for comparison (batch may have ints, file has strs)
+        problem_ids_str = set(str(pid) for pid in problem_ids)
             
         files_to_process = []
         if os.path.isdir(self.suffix_cache_data_path):
@@ -576,11 +584,12 @@ class SuffixCacheManager:
                         try:
                             entry = json.loads(line)
                             problem_id = entry.get('problem_id')
-                            if problem_id in problem_ids:
+                            problem_id_str = str(problem_id) if problem_id is not None else None
+                            if problem_id_str and problem_id_str in problem_ids_str:
                                 sequences = entry.get('sequences', [])
-                                if problem_id not in problem_id_to_sequences:
-                                    problem_id_to_sequences[problem_id] = []
-                                problem_id_to_sequences[problem_id].extend(sequences)
+                                if problem_id_str not in problem_id_to_sequences:
+                                    problem_id_to_sequences[problem_id_str] = []
+                                problem_id_to_sequences[problem_id_str].extend(sequences)
                         except json.JSONDecodeError as e:
                             logger.warning(f"Failed to parse line in {file_path}: {e}")
         except Exception as e:
@@ -688,21 +697,28 @@ class AsyncvLLMServer(AsyncServerBase):
                 }
             })
         # Get speculative config from rollout_config.engine_kwargs (not from top-level config)
+        # When method is None and enable_suffix_decoding is False, pass speculative_config=None
+        # to avoid vLLM ValidationError (num_speculative_tokens required when speculative dict is passed)
         speculative_config = rollout_config.get("engine_kwargs", {}).get("vllm", {}).get("speculative_config", {})
-        print(f"DEBUG: extracted speculative_config: {speculative_config}")
-        config_engine_kwargs = {
-            "speculative_config": {
-                "method": speculative_config.get("method", None),
-                "enable_suffix_decoding": speculative_config.get("enable_suffix_decoding", False),
-                "suffix_cache_max_depth": speculative_config.get("suffix_cache_max_depth", 64),
-                "disable_by_batch_size": speculative_config.get("disable_by_batch_size", None),
-                "num_speculative_tokens": speculative_config.get("num_speculative_tokens", None),
-                "model": speculative_config.get("model", None),
-                "suffix_max_spec_factor": speculative_config.get("suffix_max_spec_factor", 2.0),
+        method = speculative_config.get("method", None)
+        enable_suffix = speculative_config.get("enable_suffix_decoding", False)
+        if method is not None or enable_suffix:
+            config_engine_kwargs = {
+                "speculative_config": {
+                    "method": method,
+                    "enable_suffix_decoding": enable_suffix,
+                    "suffix_cache_max_depth": speculative_config.get("suffix_cache_max_depth", 64),
+                    "disable_by_batch_size": speculative_config.get("disable_by_batch_size", None),
+                    "num_speculative_tokens": speculative_config.get("num_speculative_tokens", None),
+                    "model": speculative_config.get("model", None),
+                    "suffix_max_spec_factor": speculative_config.get("suffix_max_spec_factor", 2.0),
+                }
             }
-        }
-        print(f"Speculative Config: {config_engine_kwargs['speculative_config']}")
-        engine_kwargs.update(config_engine_kwargs)
+            print(f"Speculative Config: {config_engine_kwargs['speculative_config']}")
+            engine_kwargs.update(config_engine_kwargs)
+        else:
+            engine_kwargs["speculative_config"] = None
+            print("Speculative Config: disabled (method=None, enable_suffix_decoding=False)")
 
         engine_args = AsyncEngineArgs(**engine_kwargs)
 
@@ -710,7 +726,8 @@ class AsyncvLLMServer(AsyncServerBase):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        disable_log_requests = rollout_config.get("disable_log_requests", False)
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_requests=disable_log_requests)
 
         # build serving chat
         model_config = self.engine.model_config
@@ -721,12 +738,18 @@ class AsyncvLLMServer(AsyncServerBase):
                 chat_template_str = f.read()
         else:
             chat_template_str = None
+        # disable_logging: disable all request logging; disable_received_request_log: only suppress "Received request" log
+        _request_logger = None
+        if not rollout_config.disable_logging:
+            _request_logger = (
+                RequestLogger(max_log_len=4096)
+            )
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
             model_config,
             models,
             "assistant",
-            request_logger=RequestLogger(max_log_len=4096) if not rollout_config.disable_logging else None,
+            request_logger=_request_logger,
             chat_template=chat_template_str,
             chat_template_content_format="auto",
             #return_tokens_as_token_ids=True,
@@ -736,8 +759,9 @@ class AsyncvLLMServer(AsyncServerBase):
             self.engine,
             model_config,
             models,
-            request_logger=RequestLogger(max_log_len=4096) if not rollout_config.disable_logging else None,
+            request_logger=_request_logger,
             return_tokens_as_token_ids=True,
+            verbose_received_request_log=not rollout_config.get("disable_received_request_log", False),
         )
 
         print(f"Async vLLM Server running at {await self.get_server_address()}")

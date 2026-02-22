@@ -213,11 +213,10 @@ def copy_local_path_from_hdfs(src: str, cache_dir=None, filelock=".file.lock", v
     """Deprecated. Please use copy_to_local instead."""
     from filelock import FileLock
 
-    if src is None:
+    if src is None or (isinstance(src, str) and not src.strip()):
         raise ValueError(
-            "Source path is None. This usually means the dataset's get_verl_data_path() returned None. "
-            "Ensure your dataset is registered (DatasetRegistry.register_dataset) or loaded from a file path "
-            "so a Verl-parquet can be created."
+            "Source path is None or empty. This usually means actor_rollout_ref.model.path was not set. "
+            "Ensure MODEL_PATH is set in your training script (e.g. MODEL_PATH=Qwen/Qwen3-8B) and passed as actor_rollout_ref.model.path=$MODEL_PATH"
         )
     assert src[-1] != "/", f"Make sure the last char in src is not / because it will cause error. Got {src}"
 
