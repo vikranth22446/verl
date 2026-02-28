@@ -550,9 +550,13 @@ class RayPPOTrainer:
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
         if train_dataset is None:
-            train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
+            train_files = self.config.data.train_files
+            print(f"[DEBUG DATALOADER] Loading train from: {train_files}", flush=True)
+            train_dataset = create_rl_dataset(train_files, self.config.data, self.tokenizer, self.processor)
         if val_dataset is None:
-            val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
+            val_files = self.config.data.val_files
+            print(f"[DEBUG DATALOADER] Loading val from: {val_files}", flush=True)
+            val_dataset = create_rl_dataset(val_files, self.config.data, self.tokenizer, self.processor)
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -588,6 +592,29 @@ class RayPPOTrainer:
             drop_last=False,
             collate_fn=collate_fn,
         )
+
+        # [DEBUG] DataLoader diagnostics for parallel suffix prebuilding
+        train_dataset_len = len(self.train_dataset)
+        val_dataset_len = len(self.val_dataset)
+        num_train_batches = len(self.train_dataloader)
+        num_val_batches = len(self.val_dataloader)
+        print(
+            f"[DEBUG DATALOADER] train_dataset: {train_dataset_len} samples, "
+            f"train_batch_size: {train_batch_size}, drop_last: True -> "
+            f"{num_train_batches} batches (need >=1 for parallel prebuild)",
+            flush=True,
+        )
+        print(
+            f"[DEBUG DATALOADER] val_dataset: {val_dataset_len} samples, "
+            f"val_batch_size: {val_batch_size} -> {num_val_batches} batches",
+            flush=True,
+        )
+        if train_dataset_len < train_batch_size:
+            print(
+                f"[DEBUG DATALOADER] WARNING: dataset size ({train_dataset_len}) < batch_size ({train_batch_size}) "
+                f"with drop_last=True -> dataloader will be EMPTY",
+                flush=True,
+            )
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"

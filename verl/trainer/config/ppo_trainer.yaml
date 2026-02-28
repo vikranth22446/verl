@@ -263,6 +263,7 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  generation_window_size: 5 # number of most recent steps to keep per problem_id in the problem-step map
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

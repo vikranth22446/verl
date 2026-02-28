@@ -390,19 +390,15 @@ class AsyncLLMServerManager:
     def update_suffix_generation_id(self):
         ray.get([server.update_suffix_generation_id.remote() for server in self.async_llm_servers])
 
-    def update_cache(self, problem_ids):
-        ray.get([server.update_cache.remote(problem_ids) for server in self.async_llm_servers])
-
-    def store_rollouts(self, problem_sequences, generation_step):
-        """Store rollout sequences for suffix cache."""
-        ray.get([server.store_rollouts.remote(problem_sequences, generation_step) for server in self.async_llm_servers])
+    def update_cache(self, problem_ids, problems_data=None):
+        ray.get([server.update_cache.remote(problem_ids, problems_data) for server in self.async_llm_servers])
 
     def set_hard_problems(self, hard_problems):
         ray.get([server.set_hard_problems.remote(hard_problems) for server in self.async_llm_servers])
 
-    def queue_suffix_prebuild_async(self, batch: DataProto, context: str, generation_id: int):
+    def queue_suffix_prebuild_async(self, problems_data, context: str, generation_id: int):
         for server in self.async_llm_servers:
-            server.queue_suffix_prebuild_async.remote(batch, context, generation_id)
+            server.queue_suffix_prebuild_async.remote(problems_data, context, generation_id)
     
     async def get_acceptance_length_metric_for_problems(self, problem_ids: List[int]) -> Dict:
         results = await asyncio.gather(*[

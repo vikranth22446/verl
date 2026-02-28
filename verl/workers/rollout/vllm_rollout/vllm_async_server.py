@@ -416,186 +416,23 @@ class SuffixCacheManager:
         self.suffix_generation_id = 0
         self.generation_cache_store = {}
         self.speculative_config = config.get("engine_kwargs", {}).get("vllm", {}).get("speculative_config", None)
-        self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
         self.baseline_suffix_cache = config.get("baseline_suffix_cache", False)
-        # In-memory storage: problem_id -> [[sequences_step_0], [sequences_step_1], ...]
-        self.rollout_storage = {}
-        self.max_generation_steps = config.get("max_generation_steps", None)  # Window size
         
     def update_suffix_generation_id(self):
         self.suffix_generation_id += 1
         return self.suffix_generation_id
 
-    def store_rollouts(self, problem_sequences, generation_step):
-        """Store rollout sequences in memory by problem_id.
-
-        Sequences are appended in order. If max_generation_steps is set,
-        maintains a rolling window by discarding oldest steps.
-        """
-        for problem_id, sequences in problem_sequences.items():
-            if problem_id not in self.rollout_storage:
-                self.rollout_storage[problem_id] = []
-
-            num_sequences = len(sequences)
-            self.rollout_storage[problem_id].append(sequences)
-            if self.max_generation_steps and len(self.rollout_storage[problem_id]) > self.max_generation_steps:
-                old_len = len(self.rollout_storage[problem_id])
-                self.rollout_storage[problem_id] = self.rollout_storage[problem_id][-self.max_generation_steps:]
-                logger.info(f"[SUFFIX_CACHE] Problem {problem_id}: Trimmed from {old_len} to {len(self.rollout_storage[problem_id])} steps (window={self.max_generation_steps})")
-            logger.info(f"[SUFFIX_CACHE] Stored {num_sequences} sequences for problem {problem_id} at generation_step {generation_step}. Total steps cached: {len(self.rollout_storage[problem_id])}")
-
     def should_use_suffix_cache(self):
         return (self.speculative_config and 
                 self.speculative_config.get("enable_suffix_decoding", False))
-    
-    # async def prepare_suffix_cache(self, problem_ids):
-    #     if not self.should_use_suffix_cache():
-    #         return None
-    #     if self.suffix_generation_id in self.generation_cache_store:
-    #         print("Reusing existing suffix cache for generation_id:", self.suffix_generation_id)
-    #         return self.generation_cache_store.pop(self.suffix_generation_id)
-    #     print("Cache Miss: Building new suffix cache for generation_id:", self.suffix_generation_id)
-    #     suffix_cache = await self._build_suffix_cache(problem_ids)
-    #     self.generation_cache_store[self.suffix_generation_id] = suffix_cache
-    #     return suffix_cache
-
-    # async def prepare_cache_data(self, problem_ids):
-    #     """Prepare cache data (not objects) for distribution to workers"""
-    #     if self.suffix_generation_id in self.generation_cache_store:
-    #         return self.generation_cache_store.pop(self.suffix_generation_id)
-        
-    #     cache_data = self._prepare_cache_data(problem_ids)
-    #     self.generation_cache_store[self.suffix_generation_id] = cache_data
-    #     return cache_data
-
-    def _prepare_cache_data(self, problem_ids):
-        """Convert problem_ids to cache data format using in-memory rollout storage"""
-        if self.baseline_suffix_cache:
-            return []
-
-        # First check in-memory rollout storage
-        result = []
-        cache_hits = []
-        cache_misses = []
-
-        for problem_id in problem_ids:
-            problem_id_str = str(problem_id)
-            if problem_id_str in self.rollout_storage:
-                # Flatten all sequences across all generation steps
-                all_sequences = [seq for step_sequences in self.rollout_storage[problem_id_str]
-                                for seq in step_sequences]
-                if all_sequences:
-                    result.append((problem_id_str, None, all_sequences))
-                    cache_hits.append(problem_id_str)
-                    num_steps = len(self.rollout_storage[problem_id_str])
-                    num_sequences = len(all_sequences)
-                    logger.info(f"[SUFFIX_CACHE] ✓ Cache HIT for problem {problem_id_str}: {num_sequences} sequences from {num_steps} generation steps")
-            else:
-                cache_misses.append(problem_id_str)
-
-        # Log cache statistics
-        if cache_hits or cache_misses:
-            total = len(cache_hits) + len(cache_misses)
-            hit_rate = len(cache_hits) / total * 100 if total > 0 else 0
-            logger.info(f"[SUFFIX_CACHE] Cache stats: {len(cache_hits)}/{total} hits ({hit_rate:.1f}%)")
-            if cache_misses:
-                logger.info(f"[SUFFIX_CACHE] Cache misses: {cache_misses[:5]}{'...' if len(cache_misses) > 5 else ''}")
-
-        # Fall back to loading from files if no in-memory data
-        if not result:
-            logger.warning(f"[SUFFIX_CACHE] ✗ No in-memory data, falling back to file loading for {len(problem_ids)} problems")
-            problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(problem_ids)
-            result = [(pid, None, seqs) for pid, seqs in problem_id_to_sequences.items()]
-            if result:
-                logger.info(f"[SUFFIX_CACHE] Loaded {len(result)} problems from files")
-
-        return result
 
     def _get_cache_params(self):
         """Get cache parameters for worker initialization"""
         return {
             "max_depth": self.speculative_config.get("suffix_cache_max_depth", 64),
             "thread_safe": True,
-            "max_threads": self.speculative_config.get("suffix_cache_max_threads", 8)
+            "max_threads": self.speculative_config.get("suffix_cache_max_threads", 8),
         }
-    
-    async def _build_suffix_cache(self, problem_ids):
-        if SuffixCache is None:
-            return None
-        
-        suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
-        suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
-
-        unique_problem_ids = list(set(problem_ids))
-        suffix_cache = SuffixCache(
-            max_depth=suffix_cache_max_depth,
-            thread_safe=True,
-            max_threads=suffix_cache_max_threads
-        )
-
-        if self.baseline_suffix_cache:
-            return suffix_cache
-
-        problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
-        if not problem_id_to_sequences:
-            return suffix_cache
-
-        problems_data = []
-        for problem_id in unique_problem_ids:
-            if problem_id in problem_id_to_sequences:
-                sequences = problem_id_to_sequences[problem_id]
-                problems_data.append((problem_id, None, sequences))
-
-        if problems_data:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, suffix_cache.prebuild_problems_parallel, problems_data)
-
-        return suffix_cache
-    
-    def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
-        if not self.suffix_cache_data_path or problem_ids is None or len(problem_ids) == 0:
-            return {}
-            
-        problem_id_to_sequences = {}
-        if not os.path.exists(self.suffix_cache_data_path):
-            return {}
-        
-        # Normalize problem_ids to strings for comparison (batch may have ints, file has strs)
-        problem_ids_str = set(str(pid) for pid in problem_ids)
-            
-        files_to_process = []
-        if os.path.isdir(self.suffix_cache_data_path):
-            for filename in os.listdir(self.suffix_cache_data_path):
-                if filename.endswith('.jsonl'):
-                    files_to_process.append(os.path.join(self.suffix_cache_data_path, filename))
-        elif os.path.isfile(self.suffix_cache_data_path):
-            files_to_process = [self.suffix_cache_data_path]
-        
-        if not files_to_process:
-            return {}
-            
-        try:
-            for file_path in files_to_process:
-                with open(file_path, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            problem_id = entry.get('problem_id')
-                            problem_id_str = str(problem_id) if problem_id is not None else None
-                            if problem_id_str and problem_id_str in problem_ids_str:
-                                sequences = entry.get('sequences', [])
-                                if problem_id_str not in problem_id_to_sequences:
-                                    problem_id_to_sequences[problem_id_str] = []
-                                problem_id_to_sequences[problem_id_str].extend(sequences)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse line in {file_path}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to load suffix cache data: {e}")
-                    
-        return problem_id_to_sequences
 
 @ray.remote(num_cpus=1)
 class AsyncvLLMServer(AsyncServerBase):
@@ -893,7 +730,7 @@ class AsyncvLLMServer(AsyncServerBase):
     def update_suffix_generation_id(self):
         return self.suffix_cache_manager.update_suffix_generation_id()
 
-    async def update_cache(self, problem_ids):
+    async def update_cache(self, problem_ids, problems_data=None):
         if not self.suffix_cache_manager.should_use_suffix_cache():
             return {"status": "success"}
 
@@ -915,14 +752,15 @@ class AsyncvLLMServer(AsyncServerBase):
         except Exception as e:
             logger.warning(f"Failed to activate prebuilt cache: {e}. Falling back to sync build.")
 
-        # Fallback: rebuild_cache_sync (use cached_data if available, else prepare fresh)
+        # Fallback: rebuild_cache_sync
         if cached_data is not None:
             cache_params = cached_data['cache_params']
             problems_data = cached_data['problems_data']
             logger.info(f"Rebuilding cache from stored data for generation_id={current_gen_id} (prebuild not ready)")
         else:
             cache_params = self.suffix_cache_manager._get_cache_params()
-            problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
+            if problems_data is None:
+                problems_data = []
 
         try:
             await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cache_params, problems_data))
@@ -930,11 +768,6 @@ class AsyncvLLMServer(AsyncServerBase):
         except Exception as e:
             logger.error(f"Failed to rebuild cache via collective_rpc: {e}")
             return {"status": "error", "message": str(e)}
-    
-    async def store_rollouts(self, problem_sequences, generation_step):
-        """Store rollout sequences in suffix cache manager."""
-        self.suffix_cache_manager.store_rollouts(problem_sequences, generation_step)
-        return {"status": "success"}
 
     async def set_hard_problems(self, hard_problems):
         try:
@@ -966,18 +799,22 @@ class AsyncvLLMServer(AsyncServerBase):
             logger.error(f"Failed to clear acceptance metrics for problems via collective_rpc: {e}")
             return {"status": "error", "message": str(e)}
 
-    async def queue_suffix_prebuild_async(self, batch, context: str, generation_id: int=None):
-        """Queue suffix prebuilding work for background processing."""
+    async def queue_suffix_prebuild_async(self, problems_data, context: str, generation_id: int=None):
+        """Queue suffix prebuilding work for background processing.
+
+        Args:
+            problems_data: List of (problem_id, None, sequences) tuples prepared by the Trainer.
+            context: Description of the prebuild context (e.g. "training").
+            generation_id: The generation ID this prebuild targets.
+        """
         logger.info(f"queue_suffix_prebuild_async called: context={context}, generation_id={generation_id}")
-        problem_ids = batch.non_tensor_batch.get("problem_id", None) if hasattr(batch, 'non_tensor_batch') else None
-        if problem_ids is not None:
+        if problems_data:
             cache_params = self.suffix_cache_manager._get_cache_params()
-            problems_data = self.suffix_cache_manager._prepare_cache_data(problem_ids)
-            
+
             self.suffix_cache_manager.generation_cache_store[generation_id] = {
                 'cache_params': cache_params,
-                'problems_data': problems_data
+                'problems_data': problems_data,
             }
-            
+
             await self.engine.collective_rpc("prebuild_cache_async", args=(generation_id, cache_params, problems_data))
-            logger.info(f"Background prebuild queued for generation_id={generation_id}, problem_ids={len(problem_ids)}")
+            logger.info(f"Background prebuild queued for generation_id={generation_id}, {len(problems_data)} problems")
