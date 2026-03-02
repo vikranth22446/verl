@@ -396,6 +396,12 @@ class AsyncLLMServerManager:
     def set_hard_problems(self, hard_problems):
         ray.get([server.set_hard_problems.remote(hard_problems) for server in self.async_llm_servers])
 
+    def set_problem_difficulty(self, hard_ids, medium_ids, easy_ids):
+        ray.get([
+            server.set_problem_difficulty.remote(hard_ids, medium_ids, easy_ids)
+            for server in self.async_llm_servers
+        ])
+
     def queue_suffix_prebuild_async(self, problems_data, context: str, generation_id: int):
         for server in self.async_llm_servers:
             server.queue_suffix_prebuild_async.remote(problems_data, context, generation_id)

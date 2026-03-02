@@ -777,6 +777,16 @@ class AsyncvLLMServer(AsyncServerBase):
             logger.error(f"Failed to set hard problems via collective_rpc: {e}")
             return {"status": "error", "message": str(e)}
 
+    async def set_problem_difficulty(self, hard_ids, medium_ids, easy_ids):
+        try:
+            await self.engine.collective_rpc(
+                "set_problem_difficulty", args=(hard_ids, medium_ids, easy_ids)
+            )
+            return {"status": "success"}
+        except Exception as e:
+            logger.error(f"Failed to set problem difficulty via collective_rpc: {e}")
+            return {"status": "error", "message": str(e)}
+
     async def get_acceptance_length_metric_for_problems(self, problem_ids):
         """
         Returns: {
