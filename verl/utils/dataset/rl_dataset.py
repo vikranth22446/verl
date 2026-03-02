@@ -295,9 +295,13 @@ class RLHFDataset(Dataset):
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
-        # problem_id from dataset; fallback to index for datasets (e.g. codeforces) that lack problem_id
-        extra_info = row_dict.get("extra_info")
-        row_dict["problem_id"] = (extra_info.get("problem_id") or index) if isinstance(extra_info, dict) else index
+        # problem_id: prefer top-level field, then extra_info, then fallback to index
+        raw_problem_id = row_dict.get("problem_id")
+        if raw_problem_id is None:
+            extra_info = row_dict.get("extra_info")
+            if isinstance(extra_info, dict):
+                raw_problem_id = extra_info.get("problem_id")
+        row_dict["problem_id"] = raw_problem_id if raw_problem_id is not None else index
         return row_dict
 
     def __getstate__(self):
