@@ -730,37 +730,47 @@ class AsyncvLLMServer(AsyncServerBase):
     def update_suffix_generation_id(self):
         return self.suffix_cache_manager.update_suffix_generation_id()
 
+    async def activate_prebuilt_cache_for_current_gen(self):
+        if not self.suffix_cache_manager.should_use_suffix_cache():
+            return {"status": "success", "activated": False}
+
+        current_gen_id = self.suffix_cache_manager.suffix_generation_id
+        try:
+            results = await self.engine.collective_rpc("activate_prebuilt_cache", args=(current_gen_id,))
+            activated = all(results)
+            if activated:
+                logger.info(f"Activated prebuilt cache for generation_id={current_gen_id} before collect_trajectory")
+            return {"status": "success", "activated": activated, "generation_id": current_gen_id}
+        except Exception as e:
+            logger.warning(f"Failed to activate prebuilt cache for generation_id={current_gen_id}: {e}")
+            return {"status": "error", "activated": False, "message": str(e), "generation_id": current_gen_id}
+
+    async def clear_old_suffix_cache(self):
+        """Clear stale prebuilt caches older than the current generation on all workers."""
+        if not self.suffix_cache_manager.should_use_suffix_cache():
+            return {"status": "success"}
+        current_gen_id = self.suffix_cache_manager.suffix_generation_id
+        try:
+            await self.engine.collective_rpc("clear_old_suffix_cache", args=(current_gen_id,))
+            return {"status": "success", "generation_id": current_gen_id}
+        except Exception as e:
+            logger.warning(f"Failed to clear old suffix cache for generation_id={current_gen_id}: {e}")
+            return {"status": "error", "message": str(e)}
+
     async def update_cache(self, problem_ids, problems_data=None):
+        """Synchronously rebuild the suffix cache.
+
+        Used as a fallback (e.g. validation, first step, epoch boundary)
+        when no prebuilt cache is available.  Does NOT increment
+        suffix_generation_id – the caller is responsible for that.
+        """
         if not self.suffix_cache_manager.should_use_suffix_cache():
             return {"status": "success"}
 
-        current_gen_id = self.suffix_cache_manager.update_suffix_generation_id()
-
-        # Pop cached_data if present (from queue_suffix_prebuild_async)
-        cached_data = None
-        if current_gen_id in self.suffix_cache_manager.generation_cache_store:
-            cached_data = self.suffix_cache_manager.generation_cache_store.pop(current_gen_id)
-            if not (isinstance(cached_data, dict) and 'cache_params' in cached_data):
-                cached_data = None
-
-        # First try activate_prebuilt_cache (use prebuilt result from workers if ready)
-        try:
-            results = await self.engine.collective_rpc("activate_prebuilt_cache", args=(current_gen_id,))
-            if all(results):
-                logger.info(f"Activated prebuilt cache for generation_id={current_gen_id}")
-                return {"status": "success"}
-        except Exception as e:
-            logger.warning(f"Failed to activate prebuilt cache: {e}. Falling back to sync build.")
-
-        # Fallback: rebuild_cache_sync
-        if cached_data is not None:
-            cache_params = cached_data['cache_params']
-            problems_data = cached_data['problems_data']
-            logger.info(f"Rebuilding cache from stored data for generation_id={current_gen_id} (prebuild not ready)")
-        else:
-            cache_params = self.suffix_cache_manager._get_cache_params()
-            if problems_data is None:
-                problems_data = []
+        current_gen_id = self.suffix_cache_manager.suffix_generation_id
+        cache_params = self.suffix_cache_manager._get_cache_params()
+        if problems_data is None:
+            problems_data = []
 
         try:
             await self.engine.collective_rpc("rebuild_cache_sync", args=(current_gen_id, cache_params, problems_data))

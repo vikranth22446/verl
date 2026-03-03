@@ -390,6 +390,15 @@ class AsyncLLMServerManager:
     def update_suffix_generation_id(self):
         ray.get([server.update_suffix_generation_id.remote() for server in self.async_llm_servers])
 
+    def activate_prebuilt_cache_for_current_gen(self) -> bool:
+        """Try to activate prebuilt cache on all servers. Returns True if all succeeded."""
+        results = ray.get([server.activate_prebuilt_cache_for_current_gen.remote() for server in self.async_llm_servers])
+        return all(r.get("activated", False) for r in results if isinstance(r, dict))
+
+    def clear_old_suffix_cache(self):
+        """Fire-and-forget: clear stale caches on all servers (non-blocking)."""
+        [server.clear_old_suffix_cache.remote() for server in self.async_llm_servers]
+
     def update_cache(self, problem_ids, problems_data=None):
         ray.get([server.update_cache.remote(problem_ids, problems_data) for server in self.async_llm_servers])
 
