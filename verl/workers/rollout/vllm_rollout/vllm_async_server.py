@@ -549,6 +549,16 @@ class AsyncvLLMServer(AsyncServerBase):
                     "num_speculative_tokens": speculative_config.get("num_speculative_tokens", None),
                     "model": speculative_config.get("model", None),
                     "suffix_max_spec_factor": speculative_config.get("suffix_max_spec_factor", 2.0),
+                    "das_spec_tokens_short": speculative_config.get("das_spec_tokens_short", 0),
+                    "das_spec_tokens_medium": speculative_config.get("das_spec_tokens_medium", 2),
+                    "das_spec_tokens_long": speculative_config.get("das_spec_tokens_long", 4),
+                    "das_spec_factor_short": speculative_config.get("das_spec_factor_short", 1.0),
+                    "das_spec_factor_medium": speculative_config.get("das_spec_factor_medium", 1.0),
+                    "das_spec_factor_long": speculative_config.get("das_spec_factor_long", 2.0),
+                    "das_long_ratio": speculative_config.get("das_long_ratio", 0.2),
+                    "das_medium_ratio": speculative_config.get("das_medium_ratio", 0.4),
+                    "das_online_long_threshold": speculative_config.get("das_online_long_threshold", 5000),
+                    "das_online_medium_threshold": speculative_config.get("das_online_medium_threshold", 3000),
                 }
             }
             print(f"Speculative Config: {config_engine_kwargs['speculative_config']}")
