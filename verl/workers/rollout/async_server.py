@@ -18,6 +18,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Tuple, Type
@@ -393,6 +394,7 @@ class AsyncLLMServerManager:
     def activate_prebuilt_cache_for_current_gen(self) -> bool:
         """Try to activate prebuilt cache on all servers. Returns True if all succeeded."""
         results = ray.get([server.activate_prebuilt_cache_for_current_gen.remote() for server in self.async_llm_servers])
+        print(f"[PREBUILD] activate_prebuilt_cache_for_current_gen server_results={results}", flush=True)
         return all(r.get("activated", False) for r in results if isinstance(r, dict))
 
     def clear_old_suffix_cache(self):
@@ -412,8 +414,15 @@ class AsyncLLMServerManager:
         ])
 
     def queue_suffix_prebuild_async(self, problems_data, context: str, generation_id: int):
+        t_submit_start = time.perf_counter()
         for server in self.async_llm_servers:
             server.queue_suffix_prebuild_async.remote(problems_data, context, generation_id)
+        t_submit_end = time.perf_counter()
+        print(
+            f"[PREBUILD_TIMING] gen_id={generation_id} async_server_remote_submit_s="
+            f"{(t_submit_end - t_submit_start):.3f} servers={len(self.async_llm_servers)}",
+            flush=True,
+        )
     
     async def get_acceptance_length_metric_for_problems(self, problem_ids: List[int]) -> Dict:
         results = await asyncio.gather(*[

@@ -743,6 +743,10 @@ class AsyncvLLMServer(AsyncServerBase):
             return {"status": "success", "activated": activated, "generation_id": current_gen_id}
         except Exception as e:
             logger.warning(f"Failed to activate prebuilt cache for generation_id={current_gen_id}: {e}")
+            print(
+                f"[SUFFIX_CACHE] activate_prebuilt_cache failed for generation_id={current_gen_id}: {e}",
+                flush=True,
+            )
             return {"status": "error", "activated": False, "message": str(e), "generation_id": current_gen_id}
 
     async def clear_old_suffix_cache(self):
@@ -766,7 +770,8 @@ class AsyncvLLMServer(AsyncServerBase):
         """
         if not self.suffix_cache_manager.should_use_suffix_cache():
             return {"status": "success"}
-
+        
+        print("[Failed to update cache] Update cache failed, need to rebuild cache")
         current_gen_id = self.suffix_cache_manager.suffix_generation_id
         cache_params = self.suffix_cache_manager._get_cache_params()
         if problems_data is None:
@@ -777,6 +782,13 @@ class AsyncvLLMServer(AsyncServerBase):
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Failed to rebuild cache via collective_rpc: {e}")
+            print(
+                f"[SUFFIX_CACHE] rebuild_cache_sync failed for generation_id={current_gen_id} "
+                f"(problems={len(problems_data)}). "
+                "If prebuilt activation also failed this step, workers will keep using previous cache. "
+                f"error={e}",
+                flush=True,
+            )
             return {"status": "error", "message": str(e)}
 
     async def set_hard_problems(self, hard_problems):
@@ -823,7 +835,7 @@ class AsyncvLLMServer(AsyncServerBase):
         """Queue suffix prebuilding work for background processing.
 
         Args:
-            problems_data: List of (problem_id, None, sequences) tuples prepared by the Trainer.
+            problems_data: List of dicts in canonical format for SuffixDecodingCache.prebuild_problems_parallel.
             context: Description of the prebuild context (e.g. "training").
             generation_id: The generation ID this prebuild targets.
         """
@@ -835,6 +847,24 @@ class AsyncvLLMServer(AsyncServerBase):
                 'cache_params': cache_params,
                 'problems_data': problems_data,
             }
-
+            t_rpc_start = time.perf_counter()
             await self.engine.collective_rpc("prebuild_cache_async", args=(generation_id, cache_params, problems_data))
-            logger.info(f"Background prebuild queued for generation_id={generation_id}, {len(problems_data)} problems")
+            t_rpc_end = time.perf_counter()
+            print(
+                f"[PREBUILD_TIMING] gen_id={generation_id} vllm_async_server_collective_rpc_submit_s="
+                f"{(t_rpc_end - t_rpc_start):.3f}",
+                flush=True,
+            )
+            if isinstance(problems_data, dict) and problems_data.get("mode") == "file_ref_v1":
+                n_probs = len(problems_data.get("steps_needed_by_pid", {}))
+                n_steps = len({
+                    s
+                    for steps in problems_data.get("steps_needed_by_pid", {}).values()
+                    for s in steps
+                })
+                logger.info(
+                    "Background prebuild queued for generation_id=%s, mode=file_ref_v1, problems=%s, steps=%s",
+                    generation_id, n_probs, n_steps
+                )
+            else:
+                logger.info(f"Background prebuild queued for generation_id={generation_id}, {len(problems_data)} problems")
