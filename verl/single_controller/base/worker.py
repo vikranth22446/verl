@@ -124,7 +124,9 @@ class Worker(WorkerHelper):
 
                 self.register_center = create_worker_group_register_center(name=register_center_name, info=rank_zero_info)
 
-            os.environ.update(rank_zero_info)
+            for k, v in rank_zero_info.items():
+                if os.environ.get(k) != v:
+                    os.environ[k] = v
         else:
             self.register_center = ray.get_actor(register_center_name)
 
@@ -213,9 +215,12 @@ class Worker(WorkerHelper):
         for key in type(self).env_keys():
             val = self.__dict__.get(f"_{key.lower()}", None)
             if val is not None:
-                # print(f"set {key} to {val}")
-                os.environ[key] = str(val)
-        os.environ["REDIS_STORE_SERVER_HOST"] = str(self._master_addr).replace("[", "").replace("]", "") if self._master_addr else ""
+                str_val = str(val)
+                if os.environ.get(key) != str_val:
+                    os.environ[key] = str_val
+        host = str(self._master_addr).replace("[", "").replace("]", "") if self._master_addr else ""
+        if os.environ.get("REDIS_STORE_SERVER_HOST") != host:
+            os.environ["REDIS_STORE_SERVER_HOST"] = host
 
     def get_master_addr_port(self):
         """Get the master address and port for distributed communication."""

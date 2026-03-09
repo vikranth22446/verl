@@ -70,7 +70,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Set very long timeout to effectively disable error.
-os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'
+# Avoid os.environ mutation here — getenv/setenv race causes SIGSEGV in
+# multi-threaded Ray workers.  Set in the shell launcher script instead.
+if 'VLLM_ENGINE_ITERATION_TIMEOUT_S' not in os.environ:
+    os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'
 
 vllm_version = vllm.__version__
 

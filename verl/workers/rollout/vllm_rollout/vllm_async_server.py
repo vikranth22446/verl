@@ -500,8 +500,10 @@ class AsyncvLLMServer(AsyncServerBase):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = rollout_config.get(k)
         print(f"override_generation_config: {kwargs}")
-        # Note: added for suffix cache
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        # Note: added for suffix cache — set in shell launcher to avoid
+        # getenv/setenv SIGSEGV race in multi-threaded Ray workers.
+        if "VLLM_ALLOW_INSECURE_SERIALIZATION" not in os.environ:
+            os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         engine_kwargs = {
             "model": local_path,
